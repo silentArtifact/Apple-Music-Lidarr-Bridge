@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Apple Music sign-in</title>
+<script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js" data-web-components async></script>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; color: #1d1d1f; }
+  a { color: #0066cc; }
+  button { font-size: 1.1rem; padding: .6rem 1.2rem; border: 0; border-radius: 8px; background: #fa2d48; color: #fff; cursor: pointer; }
+  button:disabled { background: #ccc; cursor: default; }
+  pre { white-space: pre-wrap; word-break: break-all; background: #f4f4f7; padding: 1rem; border-radius: 8px; }
+  .status { margin: 1rem 0; }
+</style>
+</head>
+<body>
+<p><a href="/">&larr; Back to dashboard</a></p>
+<h2>Apple Music &rarr; Lidarr: sign in</h2>
+<p>Click the button, sign in with the household Apple ID, and the new token is saved automatically. No restart needed &mdash; the bridge picks it up on its next check.</p>
+<p class="status" id="status">Loading MusicKit&hellip;</p>
+<button id="go" disabled>Sign in to Apple Music</button>
+<pre id="out" hidden></pre>
+<script>
+const DEV_TOKEN = "{{ dev_token }}";
+document.addEventListener('musickitloaded', async () => {
+  const status = document.getElementById('status');
+  const go = document.getElementById('go');
+  try {
+    await MusicKit.configure({ developerToken: DEV_TOKEN,
+      app: { name: 'AppleMusic Lidarr Bridge', build: '1.0' } });
+  } catch (e) { status.textContent = 'MusicKit configure failed: ' + e; return; }
+  const music = MusicKit.getInstance();
+  status.textContent = 'Ready. Click below and sign in with your Apple ID.';
+  go.disabled = false;
+  go.onclick = async () => {
+    try {
+      status.textContent = 'Authorizing…';
+      go.disabled = true;
+      const mut = await music.authorize();
+      const resp = await fetch('/api/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: mut }),
+      });
+      if (resp.ok) {
+        status.textContent = '✅ Success! Token saved. The bridge will resume on its next check. You can close this tab.';
+      } else {
+        const err = await resp.json().catch(() => ({}));
+        status.textContent = '⚠️ Signed in, but saving the token failed: ' + (err.error || resp.status);
+        go.disabled = false;
+      }
+    } catch (e) {
+      status.textContent = 'Authorization failed: ' + e;
+      go.disabled = false;
+    }
+  };
+});
+</script>
+</body>
+</html>

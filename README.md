@@ -129,7 +129,7 @@ Run any of these as `docker compose run --rm applemusic-lidarr <flag>`:
 
 | Flag | What it does |
 |------|--------------|
-| *(none)* | The polling loop (default container command). |
+| *(none)* | The polling loop + web UI (default container command). |
 | `--discover` | List your library playlists so you can find the Favorite Songs id. |
 | `--probe` | Dump the tail of the favorites playlist + recently-added (diagnostics). |
 | `--seed` | Record current favorites as a baseline **without** touching Lidarr. |
@@ -164,15 +164,52 @@ All settings come from `data/config.env` (see `data/config.env.example`):
 | `APPRISE_URL` | `http://172.16.238.45:8000` | Apprise base URL (optional). |
 | `APPRISE_KEY` | `media` | Apprise config key for the token-expiry alert and the add notifications. |
 | `MB_USER_AGENT` | `applemusic-lidarr/1.0 ( you@example.com )` | MusicBrainz User-Agent (set a real contact). |
+| `WEB_ENABLED` | `true` | Serve the web UI (token renewal + no-match repair) alongside the loop. `false` = headless. |
+| `WEB_PORT` | `8080` | Port the web UI listens on (route to it with a reverse proxy). |
 
 > Default IPs are placeholders from the author's setup — point them at your own
 > Lidarr/Apprise. Secrets (`AuthKey.p8`, `mut.txt`) and runtime state
 > (`state.json`) live in `data/` and are gitignored; never commit them.
 
+## Web UI
+
+When `WEB_ENABLED` (default), the container serves a small web UI on `WEB_PORT`
+alongside the poll loop. It has no authentication — put it behind a reverse proxy
+on a trusted network, never expose it publicly (it can mint a token against your
+Apple account and queue Lidarr downloads).
+
+It does two things:
+
+- **Renew the sign-in token** (`/token`) — runs Apple's MusicKit sign-in in the
+  browser and writes the new token straight to `data/mut.txt`. The loop re-reads
+  it on the next cycle, so **no restart and no terminal** — this replaces the
+  `mint_mut.py` dance for day-to-day renewals.
+- **Repair no-matches** (`/`) — lists songs the bridge couldn't confidently match
+  (from `data/unresolved.json`) and lets you search Lidarr and apply the right
+  album, **Dismiss** an entry, or **Retry** the automatic match.
+
+### Reverse proxy (Traefik example)
+
+The UI listens on `WEB_PORT` and publishes no host port; route to it over your
+docker network. With Traefik's docker provider, labels on the service:
+
+```yaml
+labels:
+  - traefik.enable=true
+  - traefik.http.routers.applemusic.rule=Host(`applemusic.local`)
+  - traefik.http.routers.applemusic.entrypoints=web
+  - traefik.http.services.applemusic.loadbalancer.server.port=8080
+```
+
+(The built-in Flask server is fine for a low-traffic internal tool. Add auth at
+the proxy if your network isn't fully trusted.)
+
 ## When the token expires
 
-The bridge alerts your Apprise endpoint. To renew: re-run `mint_mut.py` (step 3),
-copy the new `mut.txt` into `data/`, and restart the container.
+The bridge alerts your Apprise endpoint. The easy fix: open the web UI's
+**Renew sign-in token** page, sign in, done — the loop picks up the new token on
+its next cycle, no restart. (Headless/fallback: re-run `mint_mut.py` from step 3,
+copy `mut.txt` into `data/`, and restart the container.)
 
 ## Tests
 

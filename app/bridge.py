@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -56,6 +57,9 @@ NOTIFY_ON_ADD = os.environ.get("NOTIFY_ON_ADD", "true").lower() in ("1", "true",
 
 APPRISE_URL = os.environ.get("APPRISE_URL", "http://172.16.238.45:8000").rstrip("/")
 APPRISE_KEY = os.environ.get("APPRISE_KEY", "media").strip()
+
+WEB_ENABLED = os.environ.get("WEB_ENABLED", "true").lower() in ("1", "true", "yes")
+WEB_PORT = int(os.environ.get("WEB_PORT", "8080"))
 
 MB_USER_AGENT = os.environ.get(
     "MB_USER_AGENT", "applemusic-lidarr/1.0 ( matthew.gromer@icloud.com )"
@@ -121,6 +125,32 @@ def read_mut():
         return mut or None
     except OSError:
         return None
+
+
+def write_mut(token):
+    """Atomically write a freshly-minted Music User Token to disk. The poll loop
+    re-reads MUT_PATH every cycle, so no restart is needed to pick it up."""
+    token = (token or "").strip()
+    if not token:
+        raise ValueError("refusing to write an empty Music User Token")
+    tmp = MUT_PATH + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(token)
+    os.replace(tmp, MUT_PATH)
+
+
+def token_status():
+    """Report whether the stored user token currently works: 'valid', 'expired',
+    or 'missing'. Used by the web status endpoint."""
+    if not read_mut():
+        return "missing"
+    try:
+        am_get("/v1/me/storefront")
+        return "valid"
+    except MUTExpired:
+        return "expired"
+    except Exception:
+        return "valid"  # a transient non-auth error doesn't mean the token is bad
 
 
 # --------------------------------------------------------------------------- #
@@ -476,6 +506,14 @@ def alert(title, body, notify_type="warning"):
 # State
 # --------------------------------------------------------------------------- #
 
+# Guards every read-modify-write of state.json / unresolved.json so the poll
+# loop and the web UI (which run in the same process, different threads) can't
+# clobber each other. Callers hold it around the whole load->modify->save.
+_STATE_LOCK = threading.RLock()
+
+# Snapshot of the last completed loop cycle, surfaced by the web status endpoint.
+_last_cycle = {"at": None, "added": 0, "removed": 0}
+
 
 def load_state():
     """Return {"favorites": {track_id: {"rg": rg_mbid|None, "aid": artist_mbid|None}}}.
@@ -511,17 +549,44 @@ def save_state(state):
     os.replace(tmp, STATE_PATH)
 
 
+def load_unresolved():
+    """Return the list of songs the bridge couldn't confidently match."""
+    if not os.path.exists(UNRESOLVED_PATH):
+        return []
+    try:
+        with open(UNRESOLVED_PATH) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_unresolved(entries):
+    tmp = UNRESOLVED_PATH + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(entries, fh, indent=2)
+    os.replace(tmp, UNRESOLVED_PATH)
+
+
 def record_unresolved(entry):
     try:
-        existing = []
-        if os.path.exists(UNRESOLVED_PATH):
-            with open(UNRESOLVED_PATH) as fh:
-                existing = json.load(fh)
-        existing.append(entry)
-        with open(UNRESOLVED_PATH, "w") as fh:
-            json.dump(existing, fh, indent=2)
+        with _STATE_LOCK:
+            existing = load_unresolved()
+            existing.append(entry)
+            save_unresolved(existing)
     except Exception as exc:
         log.warning("Could not record unresolved favorite: %s", exc)
+
+
+def remove_unresolved(track_id):
+    """Drop the unresolved entry for a track id. Returns True if one was removed."""
+    with _STATE_LOCK:
+        entries = load_unresolved()
+        kept = [e for e in entries if e.get("id") != track_id]
+        if len(kept) == len(entries):
+            return False
+        save_unresolved(kept)
+        return True
 
 
 # --------------------------------------------------------------------------- #
@@ -582,6 +647,12 @@ def process_one(track, notify=True):
 
 
 def sync_favorites(act=True):
+    """Lock-guarded wrapper so the poll loop and web UI don't race on state.json."""
+    with _STATE_LOCK:
+        return _sync_favorites_unlocked(act)
+
+
+def _sync_favorites_unlocked(act=True):
     """Diff the current favorites against saved state; add new, un-monitor removed.
 
     Returns (added, added_ok, removed, removed_done). With act=False it only
@@ -691,6 +762,11 @@ def cmd_once():
 def cmd_backfill():
     """Process EVERY current favorite regardless of baseline — adds the whole
     backlog to Lidarr. Slow (paced by MusicBrainz + Lidarr refresh waits)."""
+    with _STATE_LOCK:
+        return _cmd_backfill_unlocked()
+
+
+def _cmd_backfill_unlocked():
     state = load_state()
     favorites = state["favorites"]
     tracks = favorite_tracks()
@@ -733,6 +809,9 @@ def cmd_loop():
     while True:
         try:
             a, aok, r, rdone = sync_favorites(act=True)
+            _last_cycle.update(
+                at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                added=a, removed=r)
             if a or r:
                 log.info("Cycle: +%d new (%d added), -%d removed (%d un-monitored)", a, aok, r, rdone)
             alerted = False
@@ -776,6 +855,18 @@ def main():
             cmd_once()
         elif args.backfill:
             cmd_backfill()
+        elif WEB_ENABLED:
+            # Default mode with the web UI: poll loop in a daemon thread, Flask
+            # in the main thread. Both share /data, guarded by _STATE_LOCK.
+            import web  # local import so CLI one-shots don't need Flask installed
+
+            # Ensure web talks to THIS module instance, not a second copy (only
+            # an issue when bridge.py is run directly as __main__; harmless via
+            # run.py, where it's already the same object).
+            web.bridge = sys.modules[__name__]
+            threading.Thread(target=cmd_loop, name="poll-loop", daemon=True).start()
+            log.info("Starting web UI on port %d", WEB_PORT)
+            web.app.run(host="0.0.0.0", port=WEB_PORT, threaded=True)
         else:
             cmd_loop()
     except MUTExpired as exc:

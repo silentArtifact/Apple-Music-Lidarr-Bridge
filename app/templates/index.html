@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Apple Music Bridge</title>
+<style>
+  :root { --fg:#1d1d1f; --muted:#6e6e73; --line:#e3e3e8; --accent:#fa2d48; --ok:#2da44e; --warn:#bf8700; --bad:#cf222e; }
+  body { font-family:-apple-system,system-ui,sans-serif; max-width:60rem; margin:2rem auto; padding:0 1rem; color:var(--fg); }
+  h1 { margin:0 0 .25rem; } .sub { color:var(--muted); margin:0 0 1.5rem; }
+  a { color:#0066cc; text-decoration:none; } a:hover { text-decoration:underline; }
+  .card { border:1px solid var(--line); border-radius:12px; padding:1rem 1.25rem; margin-bottom:1.5rem; }
+  .pill { display:inline-block; padding:.15rem .6rem; border-radius:999px; font-size:.85rem; font-weight:600; }
+  .pill.ok{background:#e6f4ea;color:var(--ok)} .pill.warn{background:#fff4d6;color:var(--warn)} .pill.bad{background:#ffebe9;color:var(--bad)}
+  .statgrid { display:flex; gap:2rem; flex-wrap:wrap; margin-top:.75rem; color:var(--muted); font-size:.9rem; }
+  .statgrid b { display:block; font-size:1.3rem; color:var(--fg); }
+  .btn { font-size:.85rem; padding:.35rem .7rem; border:1px solid var(--line); border-radius:8px; background:#fff; cursor:pointer; }
+  .btn:hover{background:#f4f4f7} .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .btn.renew{background:var(--accent);color:#fff;border-color:var(--accent);font-size:1rem;padding:.5rem 1rem}
+  .row { border-top:1px solid var(--line); padding:.85rem 0; }
+  .row:first-child{border-top:0}
+  .row .meta { font-size:.85rem; color:var(--muted); }
+  .row .actions { margin-top:.5rem; display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; }
+  .search { margin-top:.6rem; display:none; }
+  .search input { font-size:.9rem; padding:.4rem .6rem; border:1px solid var(--line); border-radius:8px; width:min(28rem,80%); }
+  .cand { display:flex; gap:.6rem; align-items:center; padding:.4rem 0; border-top:1px dashed var(--line); }
+  .cand img { width:40px; height:40px; border-radius:4px; object-fit:cover; background:#eee; }
+  .cand .t { flex:1; font-size:.9rem; } .cand .t small { color:var(--muted); }
+  .empty { color:var(--muted); }
+  .msg { font-size:.85rem; margin-left:.3rem; }
+</style>
+</head>
+<body>
+<h1>Apple Music Bridge</h1>
+<p class="sub">Favorites you star in Apple Music, handed to Lidarr automatically.</p>
+
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap">
+    <div>Apple sign-in token: <span class="pill" id="tokenPill">checking…</span></div>
+    <a class="btn renew" href="/token">Renew sign-in token</a>
+  </div>
+  <div class="statgrid">
+    <div><b id="favCount">–</b> favorites tracked</div>
+    <div><b id="unresCount">–</b> need attention</div>
+    <div><b id="lastCycle">–</b><span>last check</span></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Songs it couldn't match</h2>
+  <p class="sub" style="margin:.25rem 0 0">Pick the right album to add it to Lidarr, dismiss it, or retry the automatic match.</p>
+  <div id="unresolved"><p class="empty">Loading…</p></div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function fmtTime(iso) {
+  if (!iso) return 'never';
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  return d.toLocaleString();
+}
+
+async function loadStatus() {
+  try {
+    const s = await (await fetch('/api/status')).json();
+    const pill = $('tokenPill');
+    const map = { valid: ['ok','Valid'], expired: ['bad','Expired — renew it'], missing: ['warn','Not set up'] };
+    const [cls, label] = map[s.token] || ['warn', s.token];
+    pill.className = 'pill ' + cls; pill.textContent = label;
+    $('favCount').textContent = s.favorites;
+    $('unresCount').textContent = s.unresolved;
+    $('lastCycle').textContent = fmtTime(s.last_cycle && s.last_cycle.at);
+  } catch (e) { $('tokenPill').textContent = 'status unavailable'; }
+}
+
+function rowEl(entry) {
+  const row = document.createElement('div');
+  row.className = 'row';
+  const title = entry.name || entry.album || '(unknown song)';
+  const defaultTerm = [entry.artist, entry.album].filter(Boolean).join(' ');
+  row.innerHTML = `
+    <div><strong>${esc(title)}</strong></div>
+    <div class="meta">${esc(entry.artist || '—')} · album: ${esc(entry.album || '—')} · reason: ${esc(entry.reason || '—')}</div>
+    <div class="actions">
+      <button class="btn primary act-find">Find album</button>
+      <button class="btn act-retry">Retry auto-match</button>
+      <button class="btn act-dismiss">Dismiss</button>
+      <span class="msg"></span>
+    </div>
+    <div class="search">
+      <input type="text" value="${esc(defaultTerm)}" placeholder="artist album">
+      <button class="btn act-search">Search Lidarr</button>
+      <div class="results"></div>
+    </div>`;
+  const msg = row.querySelector('.msg');
+  const searchBox = row.querySelector('.search');
+  const input = row.querySelector('input');
+  const results = row.querySelector('.results');
+
+  row.querySelector('.act-find').onclick = () => {
+    searchBox.style.display = searchBox.style.display === 'block' ? 'none' : 'block';
+    if (searchBox.style.display === 'block') input.focus();
+  };
+  row.querySelector('.act-search').onclick = async () => {
+    results.innerHTML = '<p class="meta">Searching…</p>';
+    let list;
+    try { list = await (await fetch('/api/lidarr-search?term=' + encodeURIComponent(input.value))).json(); }
+    catch (e) { results.innerHTML = '<p class="meta">Search failed.</p>'; return; }
+    if (list.error) { results.innerHTML = '<p class="meta">Search error: ' + esc(list.error) + '</p>'; return; }
+    if (!list.length) { results.innerHTML = '<p class="meta">No candidates.</p>'; return; }
+    results.innerHTML = '';
+    for (const c of list) {
+      const cand = document.createElement('div');
+      cand.className = 'cand';
+      cand.innerHTML = `
+        ${c.cover ? `<img src="${esc(c.cover)}" alt="">` : '<img alt="">'}
+        <div class="t"><strong>${esc(c.title || '?')}</strong> <small>${esc(c.artist || '')} ${c.year ? '· ' + esc(c.year) : ''} ${c.albumType ? '· ' + esc(c.albumType) : ''}</small></div>
+        <button class="btn primary">Add this</button>`;
+      cand.querySelector('button').onclick = () => apply(entry.id, c.foreignAlbumId, row, msg);
+      results.appendChild(cand);
+    }
+  };
+  row.querySelector('.act-dismiss').onclick = () => act('/api/dismiss', { trackId: entry.id }, row, msg, 'Dismissed.');
+  row.querySelector('.act-retry').onclick = async () => {
+    msg.textContent = 'Retrying…';
+    try {
+      const r = await postJSON('/api/retry', { trackId: entry.id });
+      if (r.ok && r.matched) { fadeOut(row); }
+      else if (r.ok) { msg.textContent = 'Still no confident match — use Find album.'; }
+      else { msg.textContent = 'Error: ' + (r.error || 'failed'); }
+    } catch (e) { msg.textContent = 'Error.'; }
+    refreshCounts();
+  };
+  return row;
+}
+
+async function apply(trackId, foreignAlbumId, row, msg) {
+  msg.textContent = 'Adding to Lidarr…';
+  try {
+    const r = await postJSON('/api/resolve', { trackId, foreignAlbumId });
+    if (r.ok) { fadeOut(row); } else { msg.textContent = 'Error: ' + (r.error || 'failed'); }
+  } catch (e) { msg.textContent = 'Error.'; }
+  refreshCounts();
+}
+
+async function act(url, body, row, msg, okText) {
+  msg.textContent = '…';
+  try {
+    const r = await postJSON(url, body);
+    if (r.ok) { fadeOut(row); } else { msg.textContent = 'Error: ' + (r.error || 'failed'); }
+  } catch (e) { msg.textContent = 'Error.'; }
+  refreshCounts();
+}
+
+function fadeOut(row) {
+  row.style.transition = 'opacity .4s'; row.style.opacity = '0';
+  setTimeout(() => { row.remove(); if (!$('unresolved').querySelector('.row')) $('unresolved').innerHTML = '<p class="empty">Nothing needs attention. 🎉</p>'; }, 400);
+}
+
+async function postJSON(url, body) {
+  const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  return resp.json();
+}
+
+function refreshCounts() { loadStatus(); }
+
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function loadUnresolved() {
+  const box = $('unresolved');
+  try {
+    const list = await (await fetch('/api/unresolved')).json();
+    box.innerHTML = '';
+    if (!list.length) { box.innerHTML = '<p class="empty">Nothing needs attention. 🎉</p>'; return; }
+    for (const entry of list) box.appendChild(rowEl(entry));
+  } catch (e) { box.innerHTML = '<p class="empty">Could not load the list.</p>'; }
+}
+
+loadStatus();
+loadUnresolved();
+</script>
+</body>
+</html>

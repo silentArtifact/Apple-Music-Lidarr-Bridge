@@ -7,6 +7,9 @@ COPY app/ /app/
 
 ENV STATE_DIR=/data
 VOLUME ["/data"]
+EXPOSE 8080
 
-# No args -> the polling loop. Pass --discover/--probe/--seed/--once for setup.
-ENTRYPOINT ["python", "-u", "/app/bridge.py"]
+# No args -> the polling loop + web UI. Pass --discover/--probe/--seed/--once/
+# --backfill for one-shot CLI use (those never start the web server). Goes
+# through run.py so web.py shares the same bridge module instance as the loop.
+ENTRYPOINT ["python", "-u", "/app/run.py"]
