@@ -1,0 +1,5 @@
+# Secrets & runtime state — never commit these
+data/*
+!data/config.env.example
+__pycache__/
+*.pyc
