@@ -3,3 +3,6 @@ data/
 __pycache__/
 mint_mut.py
 *.md
+tests/
+.github/
+.git/
