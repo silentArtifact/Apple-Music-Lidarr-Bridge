@@ -591,12 +591,36 @@ class TestProcessOne(unittest.TestCase):
         ru.assert_called_once()
         self.assertEqual(out, {"rg": None, "aid": None})
 
-    def test_success_returns_ids(self):
+    def test_success_returns_ids_and_notifies(self):
         match = {"foreignAlbumId": "rg1", "artist": {"foreignArtistId": "aid1"}}
         with mock.patch.object(bridge, "resolve_album", return_value=match), \
-             mock.patch.object(bridge, "ensure_album_in_lidarr", return_value="ok"):
+             mock.patch.object(bridge, "ensure_album_in_lidarr",
+                               return_value="monitored + searched 'Alb' by A"), \
+             mock.patch.object(bridge, "NOTIFY_ON_ADD", True), \
+             mock.patch.object(bridge, "alert") as al:
             out = bridge.process_one(self._track())
         self.assertEqual(out, {"rg": "rg1", "aid": "aid1"})
+        al.assert_called_once()
+        self.assertEqual(al.call_args.kwargs["notify_type"], "success")
+        self.assertIn("monitored + searched", al.call_args.args[1])
+
+    def test_no_notification_when_notify_false(self):
+        match = {"foreignAlbumId": "rg1", "artist": {"foreignArtistId": "aid1"}}
+        with mock.patch.object(bridge, "resolve_album", return_value=match), \
+             mock.patch.object(bridge, "ensure_album_in_lidarr", return_value="ok"), \
+             mock.patch.object(bridge, "NOTIFY_ON_ADD", True), \
+             mock.patch.object(bridge, "alert") as al:
+            bridge.process_one(self._track(), notify=False)
+        al.assert_not_called()
+
+    def test_no_notification_when_disabled(self):
+        match = {"foreignAlbumId": "rg1", "artist": {"foreignArtistId": "aid1"}}
+        with mock.patch.object(bridge, "resolve_album", return_value=match), \
+             mock.patch.object(bridge, "ensure_album_in_lidarr", return_value="ok"), \
+             mock.patch.object(bridge, "NOTIFY_ON_ADD", False), \
+             mock.patch.object(bridge, "alert") as al:
+            bridge.process_one(self._track())
+        al.assert_not_called()
 
     def test_mutexpired_propagates(self):
         match = {"foreignAlbumId": "rg1", "artist": {"foreignArtistId": "aid1"}}
@@ -639,11 +663,18 @@ class TestBackfill(unittest.TestCase):
     def test_processes_every_favorite_and_saves(self):
         tracks = [self._track(f"t{i}") for i in range(3)]
         with mock.patch.object(bridge, "favorite_tracks", return_value=tracks), \
+             mock.patch.object(bridge, "NOTIFY_ON_ADD", True), \
+             mock.patch.object(bridge, "alert") as al, \
              mock.patch.object(bridge, "process_one",
-                               side_effect=lambda tr: {"rg": "rg-" + bridge.track_identity(tr),
-                                                       "aid": "a"}) as po:
+                               side_effect=lambda tr, notify=True: {
+                                   "rg": "rg-" + bridge.track_identity(tr), "aid": "a"}) as po:
             bridge.cmd_backfill()
         self.assertEqual(po.call_count, 3)
+        # per-album pings are suppressed; one summary alert fires instead
+        self.assertFalse(po.call_args_list[0].kwargs.get("notify", True))
+        al.assert_called_once()
+        self.assertEqual(al.call_args.kwargs["notify_type"], "success")
+        self.assertIn("3", al.call_args.args[1])
         with open(bridge.STATE_PATH) as fh:
             favs = json.load(fh)["favorites"]
         self.assertEqual(set(favs), {"t0", "t1", "t2"})
@@ -700,6 +731,24 @@ class TestMintDeveloperToken(unittest.TestCase):
         claims = jwt.decode(token, options={"verify_signature": False})
         self.assertEqual(claims["iss"], "TEAM123456")
         self.assertEqual(claims["exp"] - claims["iat"], 3600)
+
+
+class TestAlert(unittest.TestCase):
+    def test_posts_payload_with_type_to_key(self):
+        with mock.patch.object(bridge.requests, "post") as p:
+            bridge.alert("T", "B", notify_type="success")
+        self.assertTrue(p.call_args.args[0].endswith(f"/notify/{bridge.APPRISE_KEY}"))
+        self.assertEqual(p.call_args.kwargs["json"],
+                         {"title": "T", "body": "B", "type": "success"})
+
+    def test_default_type_is_warning(self):
+        with mock.patch.object(bridge.requests, "post") as p:
+            bridge.alert("T", "B")
+        self.assertEqual(p.call_args.kwargs["json"]["type"], "warning")
+
+    def test_never_raises_on_network_error(self):
+        with mock.patch.object(bridge.requests, "post", side_effect=RuntimeError("down")):
+            bridge.alert("T", "B")  # must swallow the error
 
 
 if __name__ == "__main__":

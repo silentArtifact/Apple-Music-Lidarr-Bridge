@@ -52,6 +52,7 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "900"))
 PROCESS_EXISTING = os.environ.get("PROCESS_EXISTING", "false").lower() in ("1", "true", "yes")
 UNMONITOR_ON_REMOVE = os.environ.get("UNMONITOR_ON_REMOVE", "true").lower() in ("1", "true", "yes")
 MAX_REMOVALS_PER_CYCLE = int(os.environ.get("MAX_REMOVALS_PER_CYCLE", "25"))
+NOTIFY_ON_ADD = os.environ.get("NOTIFY_ON_ADD", "true").lower() in ("1", "true", "yes")
 
 APPRISE_URL = os.environ.get("APPRISE_URL", "http://172.16.238.45:8000").rstrip("/")
 APPRISE_KEY = os.environ.get("APPRISE_KEY", "media").strip()
@@ -459,11 +460,11 @@ def unmonitor_album(rg_mbid, artist_mbid):
 # --------------------------------------------------------------------------- #
 
 
-def alert(title, body):
+def alert(title, body, notify_type="warning"):
     try:
         requests.post(
             f"{APPRISE_URL}/notify/{APPRISE_KEY}",
-            json={"title": title, "body": body, "type": "warning"},
+            json={"title": title, "body": body, "type": notify_type},
             timeout=15,
         )
         log.info("Sent Apprise alert: %s", title)
@@ -535,11 +536,14 @@ def favorite_tracks():
     return list(am_paginate(path))
 
 
-def process_one(track):
+def process_one(track, notify=True):
     """Resolve a favorited track and add it to Lidarr.
 
     Returns {"rg": rg_mbid, "aid": artist_mbid} on success, or {"rg": None,
-    "aid": None} if it had no usable metadata or couldn't be matched.
+    "aid": None} if it had no usable metadata or couldn't be matched. When
+    `notify` and NOTIFY_ON_ADD are both set, a success alert naming the matched
+    album is sent on handoff (backfill passes notify=False to avoid a flood and
+    sends one summary instead).
     """
     artist, album, name = track_artist_album(track)
     label = f"{artist} — {album or name}"
@@ -560,6 +564,12 @@ def process_one(track):
             return {"rg": None, "aid": None}
         status = ensure_album_in_lidarr(match)
         log.info("%s -> %s", label, status)
+        if notify and NOTIFY_ON_ADD:
+            alert(
+                "Apple Music → Lidarr",
+                f'Favorited "{name or album}" — {status}.',
+                notify_type="success",
+            )
         return {"rg": match.get("foreignAlbumId"),
                 "aid": (match.get("artist") or {}).get("foreignArtistId")}
     except MUTExpired:
@@ -692,7 +702,7 @@ def cmd_backfill():
         if not tid:
             continue
         done += 1
-        entry = process_one(track)
+        entry = process_one(track, notify=False)
         favorites[tid] = entry
         if entry.get("rg"):
             added += 1
@@ -701,6 +711,12 @@ def cmd_backfill():
             log.info("Backfill progress: %d/%d (%d added so far)", done, total, added)
     save_state(state)
     log.info("Backfill complete: %d processed, %d added to Lidarr.", done, added)
+    if NOTIFY_ON_ADD and added:
+        alert(
+            "Apple Music → Lidarr",
+            f"Backfill complete: handed {added} of {done} favorited albums to Lidarr.",
+            notify_type="success",
+        )
 
 
 def cmd_loop():

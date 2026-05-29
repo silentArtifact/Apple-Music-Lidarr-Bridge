@@ -160,8 +160,9 @@ All settings come from `data/config.env` (see `data/config.env.example`):
 | `PROCESS_EXISTING` | `false` | Backfill the whole backlog on first run. |
 | `UNMONITOR_ON_REMOVE` | `true` | Un-monitor an album when its song is un-favorited. |
 | `MAX_REMOVALS_PER_CYCLE` | `25` | If more favorites than this vanish at once, skip un-monitoring (guards against a partial API read wiping your monitoring). |
+| `NOTIFY_ON_ADD` | `true` | Send a success notification (naming the matched album) each time a favorite is handed to Lidarr. Backfill sends one summary instead of per-album pings. |
 | `APPRISE_URL` | `http://172.16.238.45:8000` | Apprise base URL (optional). |
-| `APPRISE_KEY` | `media` | Apprise config key for the token-expiry alert. |
+| `APPRISE_KEY` | `media` | Apprise config key for the token-expiry alert and the add notifications. |
 | `MB_USER_AGENT` | `applemusic-lidarr/1.0 ( you@example.com )` | MusicBrainz User-Agent (set a real contact). |
 
 > Default IPs are placeholders from the author's setup — point them at your own
