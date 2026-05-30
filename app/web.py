@@ -49,11 +49,69 @@ def api_status():
     state = bridge.load_state()
     return jsonify({
         "token": bridge.token_status(),
+        "developer_token": bridge.developer_token_status(),
         "last_cycle": bridge._last_cycle,
         "favorites": len(state.get("favorites", {})),
         "unresolved": len(bridge.load_unresolved()),
         "poll_interval": bridge.POLL_INTERVAL,
+        "lidarr_url": bridge.LIDARR_URL,
     })
+
+
+@app.get("/healthz")
+def healthz():
+    """Liveness probe for Docker HEALTHCHECK.
+
+    Healthy when the poll loop has completed a cycle within 2x POLL_INTERVAL.
+    Returns 503 with the same body shape when stale so the Docker healthcheck
+    can flip the container to 'unhealthy' on its own."""
+    last = (bridge._last_cycle or {}).get("at")
+    interval = bridge.POLL_INTERVAL or 900
+    body = {"ok": False, "last_cycle_at": last, "age_seconds": None,
+            "poll_interval": interval}
+    if not last:
+        body["reason"] = "no cycle completed yet"
+        return jsonify(body), 503
+    try:
+        from datetime import datetime
+        age = (datetime.now().astimezone().timestamp()
+               - datetime.fromisoformat(last).timestamp())
+    except Exception as exc:
+        body["reason"] = f"could not parse last_cycle_at: {exc}"
+        return jsonify(body), 503
+    body["age_seconds"] = round(age, 1)
+    if age > interval * 2:
+        body["reason"] = "loop appears stalled"
+        return jsonify(body), 503
+    body["ok"] = True
+    return jsonify(body)
+
+
+@app.get("/api/activity")
+def api_activity():
+    return jsonify(bridge.load_activity())
+
+
+@app.post("/api/sync")
+def api_sync():
+    """Trigger a sync cycle on demand. Serializes on bridge._STATE_LOCK, so it
+    can't race the poll loop; if a cycle is already running this call simply
+    waits for the lock and returns the resulting counts."""
+    try:
+        a, aok, r, rdone = bridge.sync_favorites(act=True)
+        from datetime import datetime, timezone
+        bridge._last_cycle.update(
+            at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            added=a, removed=r)
+        bridge._drain_pending_handoffs()
+    except bridge.MUTExpired as exc:
+        return jsonify({"ok": False, "error": f"token expired: {exc}"}), 401
+    except Exception as exc:
+        log.error("Manual sync failed: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, "added": a, "added_ok": aok,
+                    "removed": r, "removed_done": rdone,
+                    "last_cycle": bridge._last_cycle})
 
 
 @app.post("/api/token")
