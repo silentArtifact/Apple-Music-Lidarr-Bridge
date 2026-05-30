@@ -161,10 +161,14 @@ All settings come from `data/config.env` (see `data/config.env.example`):
 | `UNMONITOR_ON_REMOVE` | `true` | Un-monitor an album when its song is un-favorited. |
 | `MAX_REMOVALS_PER_CYCLE` | `25` | If more favorites than this vanish at once, skip un-monitoring (guards against a partial API read wiping your monitoring). |
 | `NOTIFY_ON_ADD` | `true` | Send a success notification (naming the matched album) each time a favorite is handed to Lidarr. Backfill sends one summary instead of per-album pings. |
+| `NOTIFY_DIGEST` | `true` | Coalesce per-cycle handoffs into one Apprise message at the end of each loop iteration — favoriting 10 songs in a sitting becomes one ping, not 10. `false` = per-handoff alerts. |
+| `UNRESOLVED_RETRY_INTERVAL` | `86400` | Seconds between auto-retry sweeps that re-resolve the unresolved list (catches MusicBrainz entries that get catalogued later). `0` = disable. |
+| `ACTIVITY_KEEP` | `100` | How many recent add/remove/auto-retry entries the dashboard's activity feed keeps. |
+| `DEV_TOKEN_WARN_DAYS` | `14` | Apprise a one-shot warning when the MusicKit developer JWT has fewer than this many days left. |
 | `APPRISE_URL` | `http://172.16.238.45:8000` | Apprise base URL (optional). |
 | `APPRISE_KEY` | `media` | Apprise config key for the token-expiry alert and the add notifications. |
 | `MB_USER_AGENT` | `applemusic-lidarr/1.0 ( you@example.com )` | MusicBrainz User-Agent (set a real contact). |
-| `WEB_ENABLED` | `true` | Serve the web UI (token renewal + no-match repair) alongside the loop. `false` = headless. |
+| `WEB_ENABLED` | `true` | Serve the web UI (token renewal + no-match repair + activity) alongside the loop. `false` = headless (note: disables the Docker HEALTHCHECK). |
 | `WEB_PORT` | `8080` | Port the web UI listens on (route to it with a reverse proxy). |
 
 > Default IPs are placeholders from the author's setup — point them at your own
@@ -178,7 +182,7 @@ alongside the poll loop. It has no authentication — put it behind a reverse pr
 on a trusted network, never expose it publicly (it can mint a token against your
 Apple account and queue Lidarr downloads).
 
-It does two things:
+It does several things:
 
 - **Renew the sign-in token** (`/token`) — runs Apple's MusicKit sign-in in the
   browser and writes the new token straight to `data/mut.txt`. The loop re-reads
@@ -186,7 +190,28 @@ It does two things:
   `mint_mut.py` dance for day-to-day renewals.
 - **Repair no-matches** (`/`) — lists songs the bridge couldn't confidently match
   (from `data/unresolved.json`) and lets you search Lidarr and apply the right
-  album, **Dismiss** an entry, or **Retry** the automatic match.
+  album, **Dismiss** an entry, or **Retry** the automatic match. When the
+  bridge has a low-confidence guess (title matched, artist didn't), the entry
+  shows an "Apply suggested match" button so you can confirm it in one click.
+- **Recent activity** — a rolling feed of the last `ACTIVITY_KEEP` handoffs,
+  removals, and auto-retry resolutions, with artist names linked to Lidarr.
+- **Sync now** — trigger a cycle on demand instead of waiting up to
+  `POLL_INTERVAL`. Serializes on the same lock as the loop, so it can't race.
+- **Status pills** — the Apple sign-in token and the MusicKit developer token,
+  with a countdown on the developer token (warning at `DEV_TOKEN_WARN_DAYS`).
+
+### Self-healing
+
+- The poll loop reruns the unresolved list once every
+  `UNRESOLVED_RETRY_INTERVAL` (default 24h): MusicBrainz often catalogues a
+  release a few days after streaming launch, and these re-runs catch up
+  silently. Matches are queued into the cycle's digest just like normal
+  handoffs.
+- The container ships with a Docker `HEALTHCHECK` that hits `/healthz`;
+  Docker flips the container to `unhealthy` if the loop hasn't completed a
+  cycle in `2 × POLL_INTERVAL`.
+- A one-shot Apprise warning fires when the developer token has fewer than
+  `DEV_TOKEN_WARN_DAYS` days left, so re-signing isn't a surprise.
 
 ### Reverse proxy (Traefik example)
 
