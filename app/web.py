@@ -107,23 +107,6 @@ def api_lidarr_search():
     return jsonify(out)
 
 
-def _apply_resolution(track_id, album_lookup):
-    """Add/monitor the album in Lidarr, upgrade the saved favorite from a
-    {rg:None} baseline to the real ids, and drop the unresolved entry. Returns
-    the Lidarr status string. The network call runs outside the state lock; only
-    the state write is guarded."""
-    status = bridge.ensure_album_in_lidarr(album_lookup)
-    with bridge._STATE_LOCK:
-        state = bridge.load_state()
-        state["favorites"][track_id] = {
-            "rg": album_lookup.get("foreignAlbumId"),
-            "aid": (album_lookup.get("artist") or {}).get("foreignArtistId"),
-        }
-        bridge.save_state(state)
-        bridge.remove_unresolved(track_id)
-    return status
-
-
 @app.post("/api/resolve")
 def api_resolve():
     data = request.get_json(silent=True) or {}
@@ -135,7 +118,7 @@ def api_resolve():
     if not album:
         return jsonify({"ok": False, "error": "album not found via Lidarr lookup"}), 404
     try:
-        status = _apply_resolution(track_id, album)
+        status = bridge._apply_resolution(track_id, album)
     except Exception as exc:
         log.error("Resolve failed for %s: %s", track_id, exc)
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -173,7 +156,7 @@ def api_retry():
         match = bridge.resolve_album(artist, album)
         if not match:
             return jsonify({"ok": True, "matched": False})
-        status = _apply_resolution(track_id, match)
+        status = bridge._apply_resolution(track_id, match)
     except Exception as exc:
         log.error("Retry failed for %s: %s", track_id, exc)
         return jsonify({"ok": False, "error": str(exc)}), 500

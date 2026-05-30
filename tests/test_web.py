@@ -26,6 +26,7 @@ class WebTestBase(unittest.TestCase):
             mock.patch.object(bridge, "STATE_PATH", os.path.join(self.tmp, "state.json")),
             mock.patch.object(bridge, "SEEN_PATH", os.path.join(self.tmp, "seen.json")),
             mock.patch.object(bridge, "UNRESOLVED_PATH", os.path.join(self.tmp, "unresolved.json")),
+            mock.patch.object(bridge, "ACTIVITY_PATH", os.path.join(self.tmp, "activity.json")),
             mock.patch.object(bridge, "MUT_PATH", os.path.join(self.tmp, "mut.txt")),
         ]
         for p in self._patches:
@@ -130,7 +131,7 @@ class TestResolve(WebTestBase):
             r = self.client.post("/api/resolve", json={"trackId": "t1", "foreignAlbumId": "rg1"})
         self.assertTrue(r.get_json()["ok"])
         ea.assert_called_once_with(self.ALBUM)
-        self.assertEqual(self.read_state()["t1"], {"rg": "rg1", "aid": "aid1"})
+        self.assertEqual(self.read_state()["t1"], {"rg": "rg1", "aid": "aid1", "slug": None})
         self.assertEqual(bridge.load_unresolved(), [])
 
     def test_404_when_album_not_found(self):
@@ -174,7 +175,7 @@ class TestRetry(WebTestBase):
         body = r.get_json()
         self.assertTrue(body["ok"])
         self.assertTrue(body["matched"])
-        self.assertEqual(self.read_state()["t1"], {"rg": "rg1", "aid": "aid1"})
+        self.assertEqual(self.read_state()["t1"], {"rg": "rg1", "aid": "aid1", "slug": None})
         self.assertEqual(bridge.load_unresolved(), [])
 
     def test_still_no_match_keeps_entry(self):
