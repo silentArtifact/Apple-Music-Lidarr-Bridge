@@ -132,11 +132,18 @@ function rowEl(entry) {
   row.className = 'row';
   const title = entry.name || entry.album || '(unknown song)';
   const defaultTerm = [entry.artist, entry.album].filter(Boolean).join(' ');
+  const sug = entry.suggestion || null;
+  const sugHtml = sug ? `
+      <div class="meta" style="margin-top:.35rem">
+        Suggested match: <strong>${esc(sug.title || '?')}</strong> by ${esc(sug.artist || '?')}
+      </div>` : '';
   row.innerHTML = `
     <div><strong>${esc(title)}</strong></div>
     <div class="meta">${esc(entry.artist || '—')} · album: ${esc(entry.album || '—')} · reason: ${esc(entry.reason || '—')}</div>
+    ${sugHtml}
     <div class="actions">
-      <button class="btn primary act-find">Find album</button>
+      ${sug ? '<button class="btn primary act-suggest">Apply suggested match</button>' : ''}
+      <button class="btn ${sug ? '' : 'primary'} act-find">Find album</button>
       <button class="btn act-retry">Retry auto-match</button>
       <button class="btn act-dismiss">Dismiss</button>
       <span class="msg"></span>
@@ -174,6 +181,10 @@ function rowEl(entry) {
       results.appendChild(cand);
     }
   };
+  const sugBtn = row.querySelector('.act-suggest');
+  if (sugBtn) {
+    sugBtn.onclick = () => apply(entry.id, sug.foreignAlbumId, row, msg);
+  }
   row.querySelector('.act-dismiss').onclick = () => act('/api/dismiss', { trackId: entry.id }, row, msg, 'Dismissed.');
   row.querySelector('.act-retry').onclick = async () => {
     msg.textContent = 'Retrying…';

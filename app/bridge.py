@@ -27,6 +27,7 @@ import re
 import sys
 import threading
 import time
+from collections import namedtuple
 from datetime import datetime, timezone
 
 import jwt  # PyJWT, with the `cryptography` extra for ES256
@@ -375,6 +376,15 @@ def _lidarr_text_lookup(artist, album):
     return best if best_score > 0 else None
 
 
+# Result of resolve_album. `album` is a Lidarr album lookup dict when the match
+# is confident enough to add automatically; otherwise None. `score` is the best
+# 0..3 MusicBrainz score we saw (3=title+artist exact, 2=substring+artist,
+# 1=title-only). `candidate` is non-None when score==1: a {foreignAlbumId,
+# title, artist} suggestion the dashboard can offer as "Apply suggested match",
+# turning a silent miss into a one-click confirmation.
+Resolution = namedtuple("Resolution", ["album", "score", "candidate"])
+
+
 def resolve_album(artist, album):
     """Resolve a favorited song's album to an addable Lidarr album resource.
 
@@ -382,12 +392,17 @@ def resolve_album(artist, album):
     Lidarr for that exact release-group id. Falls back to Lidarr's own loose
     text lookup if MusicBrainz finds nothing — which also covers the rare case
     where MusicBrainz is unreachable.
+
+    Returns a Resolution. The dashboard uses `.candidate` (when set) to render
+    a one-click "Apply suggested match" button on the unresolved entry.
     """
     album_q = _SUFFIX_RE.sub("", album).strip()
+    candidate = None
+    best_score = 0
     try:
         query = f'releasegroup:"{_lucene_clean(album_q)}" AND artist:"{_lucene_clean(artist)}"'
         data = mb_get("release-group", {"query": query, "limit": 10})
-        best, best_score = None, 0
+        best = None
         for rg in data.get("release-groups", []):
             score = _match_score(rg.get("title", ""), _mb_artist_name(rg), album, artist)
             if score > best_score:
@@ -395,10 +410,19 @@ def resolve_album(artist, album):
         if best and best_score >= 2:
             album_resource = _lidarr_album_by_mbid(best["id"])
             if album_resource:
-                return album_resource
+                return Resolution(album_resource, best_score, None)
+        if best and best_score == 1:
+            candidate = {
+                "foreignAlbumId": best.get("id"),
+                "title": best.get("title") or album,
+                "artist": _mb_artist_name(best) or artist,
+            }
     except Exception as exc:
         log.warning("MusicBrainz lookup failed for %s — %s: %s", artist, album, exc)
-    return _lidarr_text_lookup(artist, album)
+    fallback = _lidarr_text_lookup(artist, album)
+    if fallback:
+        return Resolution(fallback, max(best_score, 2), None)
+    return Resolution(None, best_score, candidate)
 
 
 def find_existing_artist(artist_mbid):
@@ -786,12 +810,17 @@ def process_one(track, notify=True):
         return {"rg": None, "aid": None}
 
     try:
-        match = resolve_album(artist, album)
-        if not match:
-            log.warning("No confident match for: %s", label)
-            record_unresolved({"id": tid, "name": name, "artist": artist,
-                               "album": album, "reason": "no match"})
+        res = resolve_album(artist, album)
+        if not res.album:
+            reason = "low confidence" if res.candidate else "no match"
+            log.warning("No confident match for: %s (%s)", label, reason)
+            entry = {"id": tid, "name": name, "artist": artist,
+                     "album": album, "reason": reason}
+            if res.candidate:
+                entry["suggestion"] = res.candidate
+            record_unresolved(entry)
             return {"rg": None, "aid": None}
+        match = res.album
         status = ensure_album_in_lidarr(match)
         log.info("%s -> %s", label, status)
         slug, cover = album_display_meta(match)
@@ -1000,19 +1029,19 @@ def _auto_retry_unresolved():
         if not (tid and artist and album):
             continue
         try:
-            match = resolve_album(artist, album)
+            res = resolve_album(artist, album)
         except MUTExpired:
             raise
         except Exception as exc:
             log.warning("Auto-retry lookup failed for %s — %s: %s", artist, album, exc)
-            match = None
-        if not match:
+            res = Resolution(None, 0, None)
+        if not res.album:
             stayed += 1
             append_activity({"kind": "auto-retry-no-match",
                              "artist": artist, "album": album})
             continue
         try:
-            status = _apply_resolution(tid, match)
+            status = _apply_resolution(tid, res.album)
         except MUTExpired:
             raise
         except Exception as exc:

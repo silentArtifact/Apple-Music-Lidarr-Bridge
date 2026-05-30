@@ -211,10 +211,10 @@ def api_retry():
         return jsonify({"ok": True, "matched": False,
                         "error": "entry has no artist/album to search on"})
     try:
-        match = bridge.resolve_album(artist, album)
-        if not match:
+        res = bridge.resolve_album(artist, album)
+        if not res.album:
             return jsonify({"ok": True, "matched": False})
-        status = bridge._apply_resolution(track_id, match)
+        status = bridge._apply_resolution(track_id, res.album)
     except Exception as exc:
         log.error("Retry failed for %s: %s", track_id, exc)
         return jsonify({"ok": False, "error": str(exc)}), 500

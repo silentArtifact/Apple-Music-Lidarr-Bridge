@@ -174,7 +174,8 @@ class TestRetry(WebTestBase):
         self.seed_unresolved([{"id": "t1", "artist": "A", "album": "Alb", "reason": "no match"}])
 
     def test_match_applies(self):
-        with mock.patch.object(bridge, "resolve_album", return_value=self.ALBUM), \
+        with mock.patch.object(bridge, "resolve_album",
+                               return_value=bridge.Resolution(self.ALBUM, 3, None)), \
              mock.patch.object(bridge, "ensure_album_in_lidarr", return_value="ok"):
             r = self.client.post("/api/retry", json={"trackId": "t1"})
         body = r.get_json()
@@ -184,7 +185,8 @@ class TestRetry(WebTestBase):
         self.assertEqual(bridge.load_unresolved(), [])
 
     def test_still_no_match_keeps_entry(self):
-        with mock.patch.object(bridge, "resolve_album", return_value=None), \
+        with mock.patch.object(bridge, "resolve_album",
+                               return_value=bridge.Resolution(None, 0, None)), \
              mock.patch.object(bridge, "ensure_album_in_lidarr") as ea:
             r = self.client.post("/api/retry", json={"trackId": "t1"})
         body = r.get_json()
@@ -256,6 +258,31 @@ class TestActivityEndpoint(WebTestBase):
     def test_empty_when_no_activity(self):
         r = self.client.get("/api/activity")
         self.assertEqual(r.get_json(), [])
+
+
+class TestSuggestionApply(WebTestBase):
+    """A low-confidence unresolved entry carries `suggestion: {foreignAlbumId,
+    title, artist}`. The 'Apply suggested match' button just calls /api/resolve
+    with that foreignAlbumId — verify that round-trip clears the entry."""
+
+    ALBUM = {"foreignAlbumId": "rg-low", "title": "Maybe",
+             "artist": {"foreignArtistId": "aid-low", "artistName": "Maybe?"}}
+
+    def test_apply_suggestion_clears_unresolved(self):
+        self.seed_state({"t1": {"rg": None, "aid": None}})
+        self.seed_unresolved([{
+            "id": "t1", "artist": "Foo", "album": "Maybe",
+            "reason": "low confidence",
+            "suggestion": {"foreignAlbumId": "rg-low",
+                           "title": "Maybe", "artist": "Maybe?"},
+        }])
+        with mock.patch.object(bridge, "_lidarr_album_by_mbid", return_value=self.ALBUM), \
+             mock.patch.object(bridge, "ensure_album_in_lidarr", return_value="ok"):
+            r = self.client.post("/api/resolve",
+                                 json={"trackId": "t1", "foreignAlbumId": "rg-low"})
+        self.assertTrue(r.get_json()["ok"])
+        self.assertEqual(bridge.load_unresolved(), [])
+        self.assertEqual(self.read_state()["t1"]["rg"], "rg-low")
 
 
 class TestSyncEndpoint(WebTestBase):
