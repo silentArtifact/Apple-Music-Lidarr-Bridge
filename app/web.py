@@ -49,11 +49,69 @@ def api_status():
     state = bridge.load_state()
     return jsonify({
         "token": bridge.token_status(),
+        "developer_token": bridge.developer_token_status(),
         "last_cycle": bridge._last_cycle,
         "favorites": len(state.get("favorites", {})),
         "unresolved": len(bridge.load_unresolved()),
         "poll_interval": bridge.POLL_INTERVAL,
+        "lidarr_url": bridge.LIDARR_URL,
     })
+
+
+@app.get("/healthz")
+def healthz():
+    """Liveness probe for Docker HEALTHCHECK.
+
+    Healthy when the poll loop has completed a cycle within 2x POLL_INTERVAL.
+    Returns 503 with the same body shape when stale so the Docker healthcheck
+    can flip the container to 'unhealthy' on its own."""
+    last = (bridge._last_cycle or {}).get("at")
+    interval = bridge.POLL_INTERVAL or 900
+    body = {"ok": False, "last_cycle_at": last, "age_seconds": None,
+            "poll_interval": interval}
+    if not last:
+        body["reason"] = "no cycle completed yet"
+        return jsonify(body), 503
+    try:
+        from datetime import datetime
+        age = (datetime.now().astimezone().timestamp()
+               - datetime.fromisoformat(last).timestamp())
+    except Exception as exc:
+        body["reason"] = f"could not parse last_cycle_at: {exc}"
+        return jsonify(body), 503
+    body["age_seconds"] = round(age, 1)
+    if age > interval * 2:
+        body["reason"] = "loop appears stalled"
+        return jsonify(body), 503
+    body["ok"] = True
+    return jsonify(body)
+
+
+@app.get("/api/activity")
+def api_activity():
+    return jsonify(bridge.load_activity())
+
+
+@app.post("/api/sync")
+def api_sync():
+    """Trigger a sync cycle on demand. Serializes on bridge._STATE_LOCK, so it
+    can't race the poll loop; if a cycle is already running this call simply
+    waits for the lock and returns the resulting counts."""
+    try:
+        a, aok, r, rdone = bridge.sync_favorites(act=True)
+        from datetime import datetime, timezone
+        bridge._last_cycle.update(
+            at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            added=a, removed=r)
+        bridge._drain_pending_handoffs()
+    except bridge.MUTExpired as exc:
+        return jsonify({"ok": False, "error": f"token expired: {exc}"}), 401
+    except Exception as exc:
+        log.error("Manual sync failed: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, "added": a, "added_ok": aok,
+                    "removed": r, "removed_done": rdone,
+                    "last_cycle": bridge._last_cycle})
 
 
 @app.post("/api/token")
@@ -107,23 +165,6 @@ def api_lidarr_search():
     return jsonify(out)
 
 
-def _apply_resolution(track_id, album_lookup):
-    """Add/monitor the album in Lidarr, upgrade the saved favorite from a
-    {rg:None} baseline to the real ids, and drop the unresolved entry. Returns
-    the Lidarr status string. The network call runs outside the state lock; only
-    the state write is guarded."""
-    status = bridge.ensure_album_in_lidarr(album_lookup)
-    with bridge._STATE_LOCK:
-        state = bridge.load_state()
-        state["favorites"][track_id] = {
-            "rg": album_lookup.get("foreignAlbumId"),
-            "aid": (album_lookup.get("artist") or {}).get("foreignArtistId"),
-        }
-        bridge.save_state(state)
-        bridge.remove_unresolved(track_id)
-    return status
-
-
 @app.post("/api/resolve")
 def api_resolve():
     data = request.get_json(silent=True) or {}
@@ -135,7 +176,7 @@ def api_resolve():
     if not album:
         return jsonify({"ok": False, "error": "album not found via Lidarr lookup"}), 404
     try:
-        status = _apply_resolution(track_id, album)
+        status = bridge._apply_resolution(track_id, album)
     except Exception as exc:
         log.error("Resolve failed for %s: %s", track_id, exc)
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -170,10 +211,10 @@ def api_retry():
         return jsonify({"ok": True, "matched": False,
                         "error": "entry has no artist/album to search on"})
     try:
-        match = bridge.resolve_album(artist, album)
-        if not match:
+        res = bridge.resolve_album(artist, album)
+        if not res.album:
             return jsonify({"ok": True, "matched": False})
-        status = _apply_resolution(track_id, match)
+        status = bridge._apply_resolution(track_id, res.album)
     except Exception as exc:
         log.error("Retry failed for %s: %s", track_id, exc)
         return jsonify({"ok": False, "error": str(exc)}), 500

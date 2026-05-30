@@ -17,6 +17,7 @@
   .btn { font-size:.85rem; padding:.35rem .7rem; border:1px solid var(--line); border-radius:8px; background:#fff; cursor:pointer; }
   .btn:hover{background:#f4f4f7} .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
   .btn.renew{background:var(--accent);color:#fff;border-color:var(--accent);font-size:1rem;padding:.5rem 1rem}
+  .btn[disabled]{opacity:.55;cursor:not-allowed}
   .row { border-top:1px solid var(--line); padding:.85rem 0; }
   .row:first-child{border-top:0}
   .row .meta { font-size:.85rem; color:var(--muted); }
@@ -28,6 +29,15 @@
   .cand .t { flex:1; font-size:.9rem; } .cand .t small { color:var(--muted); }
   .empty { color:var(--muted); }
   .msg { font-size:.85rem; margin-left:.3rem; }
+  .toolbar { margin-top:.5rem; display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; }
+  .act-list { margin:0; padding:0; list-style:none; }
+  .act { display:flex; gap:.7rem; align-items:center; padding:.55rem 0; border-top:1px solid var(--line); font-size:.92rem; }
+  .act:first-child{border-top:0}
+  .act img { width:40px; height:40px; border-radius:4px; object-fit:cover; background:#eee; flex:0 0 40px; }
+  .act .body { flex:1; }
+  .act .when { color:var(--muted); font-size:.8rem; }
+  .act.add .kind{color:var(--ok)} .act.remove .kind{color:var(--muted)} .act.retry .kind{color:var(--accent)}
+  .kind { font-weight:600; font-size:.75rem; text-transform:uppercase; letter-spacing:.03em; }
 </style>
 </head>
 <body>
@@ -36,13 +46,20 @@
 
 <div class="card">
   <div style="display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap">
-    <div>Apple sign-in token: <span class="pill" id="tokenPill">checking…</span></div>
+    <div style="display:flex;gap:1.5rem;flex-wrap:wrap;align-items:center">
+      <div>Apple sign-in token: <span class="pill" id="tokenPill">checking…</span></div>
+      <div>Developer token: <span class="pill" id="devTokenPill">checking…</span></div>
+    </div>
     <a class="btn renew" href="/token">Renew sign-in token</a>
   </div>
   <div class="statgrid">
     <div><b id="favCount">–</b> favorites tracked</div>
     <div><b id="unresCount">–</b> need attention</div>
     <div><b id="lastCycle">–</b><span>last check</span></div>
+  </div>
+  <div class="toolbar">
+    <button class="btn primary" id="syncBtn">Sync now</button>
+    <span class="msg" id="syncMsg"></span>
   </div>
 </div>
 
@@ -52,8 +69,18 @@
   <div id="unresolved"><p class="empty">Loading…</p></div>
 </div>
 
+<div class="card">
+  <h2 style="margin-top:0">Recent activity</h2>
+  <p class="sub" style="margin:.25rem 0 0">The last few albums the bridge handed to Lidarr or un-monitored. Refreshes automatically.</p>
+  <ul class="act-list" id="activity"><li class="empty">Loading…</li></ul>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
+
+// Cached at first load from /api/status so activity rows can link to Lidarr.
+let LIDARR_URL = '';
+let refreshing = false;
 
 function fmtTime(iso) {
   if (!iso) return 'never';
@@ -62,13 +89,38 @@ function fmtTime(iso) {
   return d.toLocaleString();
 }
 
+function fmtRelative(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  const s = Math.round((Date.now() - d.getTime()) / 1000);
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.round(s/60) + 'm ago';
+  if (s < 86400) return Math.round(s/3600) + 'h ago';
+  return Math.round(s/86400) + 'd ago';
+}
+
 async function loadStatus() {
   try {
     const s = await (await fetch('/api/status')).json();
+    LIDARR_URL = (s.lidarr_url || '').replace(/\/$/, '');
     const pill = $('tokenPill');
     const map = { valid: ['ok','Valid'], expired: ['bad','Expired — renew it'], missing: ['warn','Not set up'] };
     const [cls, label] = map[s.token] || ['warn', s.token];
     pill.className = 'pill ' + cls; pill.textContent = label;
+
+    const dev = s.developer_token || {};
+    const dpill = $('devTokenPill');
+    const dmap = { ok: 'ok', warning: 'warn', critical: 'bad', unknown: 'warn' };
+    const dcls = dmap[dev.level] || 'warn';
+    let dlabel = 'unknown';
+    if (dev.days_remaining != null) {
+      const days = Math.round(dev.days_remaining);
+      dlabel = days > 1 ? days + ' days left' : days === 1 ? '1 day left' : '< 1 day';
+    }
+    dpill.className = 'pill ' + dcls; dpill.textContent = dlabel;
+    if (dev.exp_at) dpill.title = 'expires ' + fmtTime(dev.exp_at);
+
     $('favCount').textContent = s.favorites;
     $('unresCount').textContent = s.unresolved;
     $('lastCycle').textContent = fmtTime(s.last_cycle && s.last_cycle.at);
@@ -80,11 +132,18 @@ function rowEl(entry) {
   row.className = 'row';
   const title = entry.name || entry.album || '(unknown song)';
   const defaultTerm = [entry.artist, entry.album].filter(Boolean).join(' ');
+  const sug = entry.suggestion || null;
+  const sugHtml = sug ? `
+      <div class="meta" style="margin-top:.35rem">
+        Suggested match: <strong>${esc(sug.title || '?')}</strong> by ${esc(sug.artist || '?')}
+      </div>` : '';
   row.innerHTML = `
     <div><strong>${esc(title)}</strong></div>
     <div class="meta">${esc(entry.artist || '—')} · album: ${esc(entry.album || '—')} · reason: ${esc(entry.reason || '—')}</div>
+    ${sugHtml}
     <div class="actions">
-      <button class="btn primary act-find">Find album</button>
+      ${sug ? '<button class="btn primary act-suggest">Apply suggested match</button>' : ''}
+      <button class="btn ${sug ? '' : 'primary'} act-find">Find album</button>
       <button class="btn act-retry">Retry auto-match</button>
       <button class="btn act-dismiss">Dismiss</button>
       <span class="msg"></span>
@@ -122,6 +181,10 @@ function rowEl(entry) {
       results.appendChild(cand);
     }
   };
+  const sugBtn = row.querySelector('.act-suggest');
+  if (sugBtn) {
+    sugBtn.onclick = () => apply(entry.id, sug.foreignAlbumId, row, msg);
+  }
   row.querySelector('.act-dismiss').onclick = () => act('/api/dismiss', { trackId: entry.id }, row, msg, 'Dismissed.');
   row.querySelector('.act-retry').onclick = async () => {
     msg.textContent = 'Retrying…';
@@ -131,7 +194,7 @@ function rowEl(entry) {
       else if (r.ok) { msg.textContent = 'Still no confident match — use Find album.'; }
       else { msg.textContent = 'Error: ' + (r.error || 'failed'); }
     } catch (e) { msg.textContent = 'Error.'; }
-    refreshCounts();
+    refreshAll();
   };
   return row;
 }
@@ -142,7 +205,7 @@ async function apply(trackId, foreignAlbumId, row, msg) {
     const r = await postJSON('/api/resolve', { trackId, foreignAlbumId });
     if (r.ok) { fadeOut(row); } else { msg.textContent = 'Error: ' + (r.error || 'failed'); }
   } catch (e) { msg.textContent = 'Error.'; }
-  refreshCounts();
+  refreshAll();
 }
 
 async function act(url, body, row, msg, okText) {
@@ -151,7 +214,7 @@ async function act(url, body, row, msg, okText) {
     const r = await postJSON(url, body);
     if (r.ok) { fadeOut(row); } else { msg.textContent = 'Error: ' + (r.error || 'failed'); }
   } catch (e) { msg.textContent = 'Error.'; }
-  refreshCounts();
+  refreshAll();
 }
 
 function fadeOut(row) {
@@ -163,8 +226,6 @@ async function postJSON(url, body) {
   const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   return resp.json();
 }
-
-function refreshCounts() { loadStatus(); }
 
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
@@ -178,8 +239,78 @@ async function loadUnresolved() {
   } catch (e) { box.innerHTML = '<p class="empty">Could not load the list.</p>'; }
 }
 
+const KIND_LABEL = {
+  'add': 'added',
+  'remove': 'un-monitored',
+  'auto-retry-match': 'auto-matched',
+  'auto-retry-no-match': 'still no match',
+};
+
+function artistLink(slug, artist) {
+  if (!slug || !LIDARR_URL) return esc(artist || '—');
+  return `<a href="${esc(LIDARR_URL)}/artist/${esc(slug)}" target="_blank" rel="noopener">${esc(artist || slug)}</a>`;
+}
+
+async function loadActivity() {
+  const box = $('activity');
+  try {
+    const list = await (await fetch('/api/activity')).json();
+    if (!list.length) { box.innerHTML = '<li class="empty">Nothing yet — the loop reports here as it works.</li>'; return; }
+    box.innerHTML = '';
+    for (const e of list.slice(0, 20)) {
+      const li = document.createElement('li');
+      const cls = e.kind === 'add' || e.kind === 'auto-retry-match' ? 'add'
+                : e.kind === 'remove' ? 'remove' : 'retry';
+      li.className = 'act ' + cls;
+      const kindLabel = KIND_LABEL[e.kind] || e.kind;
+      const status = e.status ? ' — ' + esc(e.status) : '';
+      const album = e.album ? ` — <strong>${esc(e.album)}</strong>` : '';
+      const artistHtml = e.artist ? ' by ' + artistLink(e.slug, e.artist) : '';
+      li.innerHTML = `
+        ${e.cover ? `<img src="${esc(e.cover)}" alt="">` : '<img alt="">'}
+        <div class="body">
+          <span class="kind">${esc(kindLabel)}</span>${album}${artistHtml}<span class="when"> · ${esc(fmtRelative(e.at))}</span>
+          <div class="meta">${status.replace(/^ — /, '')}</div>
+        </div>`;
+      box.appendChild(li);
+    }
+  } catch (e) { box.innerHTML = '<li class="empty">Could not load activity.</li>'; }
+}
+
+async function refreshAll() {
+  if (refreshing) return;
+  refreshing = true;
+  try { await Promise.all([loadStatus(), loadActivity()]); }
+  finally { refreshing = false; }
+}
+
+$('syncBtn').onclick = async () => {
+  const btn = $('syncBtn'); const msg = $('syncMsg');
+  btn.disabled = true; msg.textContent = 'Syncing…';
+  try {
+    const r = await postJSON('/api/sync', {});
+    if (r.ok) {
+      msg.textContent = `Done — +${r.added} (${r.added_ok} added), -${r.removed} (${r.removed_done} un-monitored).`;
+    } else {
+      msg.textContent = 'Error: ' + (r.error || 'failed');
+    }
+  } catch (e) {
+    msg.textContent = 'Error.';
+  }
+  btn.disabled = false;
+  await refreshAll();
+  await loadUnresolved();
+};
+
 loadStatus();
 loadUnresolved();
+loadActivity();
+
+// Auto-refresh status + activity every 5s, paused when the tab isn't visible.
+setInterval(() => {
+  if (document.visibilityState === 'hidden') return;
+  refreshAll();
+}, 5000);
 </script>
 </body>
 </html>

@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -101,26 +102,52 @@ class TestResolveAlbum(unittest.TestCase):
               "artist-credit": [{"artist": {"name": "Radiohead"}}]}
         with mock.patch.object(bridge, "mb_get", return_value={"release-groups": [rg]}), \
              mock.patch.object(bridge, "lidarr", return_value=[self.ALBUM]) as lid:
-            result = bridge.resolve_album("Radiohead", "OK Computer")
-        self.assertEqual(result["foreignAlbumId"], "rg-mbid")
+            res = bridge.resolve_album("Radiohead", "OK Computer")
+        self.assertEqual(res.album["foreignAlbumId"], "rg-mbid")
+        self.assertEqual(res.score, 3)
+        self.assertIsNone(res.candidate)
         lid.assert_called_with("GET", "/album/lookup", params={"term": "lidarr:rg-mbid"})
 
     def test_falls_back_to_text_lookup_when_mb_empty(self):
         with mock.patch.object(bridge, "mb_get", return_value={"release-groups": []}), \
              mock.patch.object(bridge, "lidarr", return_value=[self.ALBUM]):
-            result = bridge.resolve_album("Radiohead", "OK Computer")
-        self.assertEqual(result["title"], "OK Computer")
+            res = bridge.resolve_album("Radiohead", "OK Computer")
+        self.assertEqual(res.album["title"], "OK Computer")
 
     def test_falls_back_when_musicbrainz_unreachable(self):
         with mock.patch.object(bridge, "mb_get", side_effect=RuntimeError("503")), \
              mock.patch.object(bridge, "lidarr", return_value=[self.ALBUM]):
-            result = bridge.resolve_album("Radiohead", "OK Computer")
-        self.assertEqual(result["title"], "OK Computer")
+            res = bridge.resolve_album("Radiohead", "OK Computer")
+        self.assertEqual(res.album["title"], "OK Computer")
 
     def test_returns_none_when_nothing_matches(self):
         with mock.patch.object(bridge, "mb_get", return_value={"release-groups": []}), \
              mock.patch.object(bridge, "lidarr", return_value=[]):
-            self.assertIsNone(bridge.resolve_album("Nobody", "Nothing"))
+            res = bridge.resolve_album("Nobody", "Nothing")
+        self.assertIsNone(res.album)
+        self.assertIsNone(res.candidate)
+        self.assertEqual(res.score, 0)
+
+    def test_low_confidence_returns_candidate(self):
+        # Title matches but artist doesn't -> score 1 -> populated candidate
+        # for the dashboard's "Apply suggested match" affordance. No Lidarr
+        # call should fire (we don't pre-resolve low-confidence matches).
+        rg = {"id": "rg-lcm", "title": "OK Computer",
+              "artist-credit": [{"artist": {"name": "Some Other Band"}}]}
+        with mock.patch.object(bridge, "mb_get",
+                               return_value={"release-groups": [rg]}), \
+             mock.patch.object(bridge, "lidarr", return_value=[]) as lid:
+            res = bridge.resolve_album("Radiohead", "OK Computer")
+        self.assertIsNone(res.album)
+        self.assertEqual(res.score, 1)
+        self.assertEqual(res.candidate["foreignAlbumId"], "rg-lcm")
+        self.assertEqual(res.candidate["title"], "OK Computer")
+        self.assertEqual(res.candidate["artist"], "Some Other Band")
+        # Lidarr is only consulted for the text-lookup fallback, never for
+        # the score-1 pre-resolution.
+        self.assertEqual(lid.call_count, 1)
+        self.assertEqual(lid.call_args.kwargs["params"]["term"],
+                         "Radiohead OK Computer")
 
 
 class TestSyncFavorites(unittest.TestCase):
@@ -129,6 +156,7 @@ class TestSyncFavorites(unittest.TestCase):
         self._patches = [
             mock.patch.object(bridge, "STATE_PATH", os.path.join(self.tmp, "state.json")),
             mock.patch.object(bridge, "SEEN_PATH", os.path.join(self.tmp, "seen.json")),
+            mock.patch.object(bridge, "ACTIVITY_PATH", os.path.join(self.tmp, "activity.json")),
             mock.patch.object(bridge, "UNMONITOR_ON_REMOVE", True),
             mock.patch.object(bridge, "MAX_REMOVALS_PER_CYCLE", 25),
         ]
@@ -583,7 +611,8 @@ class TestProcessOne(unittest.TestCase):
         self.assertEqual(out, {"rg": None, "aid": None})
 
     def test_no_match_records_unresolved(self):
-        with mock.patch.object(bridge, "resolve_album", return_value=None), \
+        with mock.patch.object(bridge, "resolve_album",
+                               return_value=bridge.Resolution(None, 0, None)), \
              mock.patch.object(bridge, "ensure_album_in_lidarr") as ea, \
              mock.patch.object(bridge, "record_unresolved") as ru:
             out = bridge.process_one(self._track())
@@ -592,21 +621,44 @@ class TestProcessOne(unittest.TestCase):
         self.assertEqual(out, {"rg": None, "aid": None})
 
     def test_success_returns_ids_and_notifies(self):
+        # Per-handoff path (NOTIFY_DIGEST=False): alert is sent immediately.
         match = {"foreignAlbumId": "rg1", "artist": {"foreignArtistId": "aid1"}}
-        with mock.patch.object(bridge, "resolve_album", return_value=match), \
+        with mock.patch.object(bridge, "resolve_album",
+                               return_value=bridge.Resolution(match, 3, None)), \
              mock.patch.object(bridge, "ensure_album_in_lidarr",
                                return_value="monitored + searched 'Alb' by A"), \
              mock.patch.object(bridge, "NOTIFY_ON_ADD", True), \
+             mock.patch.object(bridge, "NOTIFY_DIGEST", False), \
+             mock.patch.object(bridge, "append_activity"), \
              mock.patch.object(bridge, "alert") as al:
             out = bridge.process_one(self._track())
-        self.assertEqual(out, {"rg": "rg1", "aid": "aid1"})
+        self.assertEqual(out, {"rg": "rg1", "aid": "aid1", "slug": None})
         al.assert_called_once()
         self.assertEqual(al.call_args.kwargs["notify_type"], "success")
         self.assertIn("monitored + searched", al.call_args.args[1])
 
+    def test_success_queues_handoff_when_digesting(self):
+        # Default path (NOTIFY_DIGEST=True): no immediate alert; the handoff
+        # is appended to the digest queue for the cycle's drain.
+        match = {"foreignAlbumId": "rg1", "artist": {"foreignArtistId": "aid1"}}
+        bridge._pending_handoffs.clear()
+        with mock.patch.object(bridge, "resolve_album",
+                               return_value=bridge.Resolution(match, 3, None)), \
+             mock.patch.object(bridge, "ensure_album_in_lidarr", return_value="ok"), \
+             mock.patch.object(bridge, "NOTIFY_ON_ADD", True), \
+             mock.patch.object(bridge, "NOTIFY_DIGEST", True), \
+             mock.patch.object(bridge, "append_activity"), \
+             mock.patch.object(bridge, "alert") as al:
+            bridge.process_one(self._track())
+        al.assert_not_called()
+        self.assertEqual(len(bridge._pending_handoffs), 1)
+        self.assertEqual(bridge._pending_handoffs[0]["status"], "ok")
+        bridge._pending_handoffs.clear()
+
     def test_no_notification_when_notify_false(self):
         match = {"foreignAlbumId": "rg1", "artist": {"foreignArtistId": "aid1"}}
-        with mock.patch.object(bridge, "resolve_album", return_value=match), \
+        with mock.patch.object(bridge, "resolve_album",
+                               return_value=bridge.Resolution(match, 3, None)), \
              mock.patch.object(bridge, "ensure_album_in_lidarr", return_value="ok"), \
              mock.patch.object(bridge, "NOTIFY_ON_ADD", True), \
              mock.patch.object(bridge, "alert") as al:
@@ -615,7 +667,8 @@ class TestProcessOne(unittest.TestCase):
 
     def test_no_notification_when_disabled(self):
         match = {"foreignAlbumId": "rg1", "artist": {"foreignArtistId": "aid1"}}
-        with mock.patch.object(bridge, "resolve_album", return_value=match), \
+        with mock.patch.object(bridge, "resolve_album",
+                               return_value=bridge.Resolution(match, 3, None)), \
              mock.patch.object(bridge, "ensure_album_in_lidarr", return_value="ok"), \
              mock.patch.object(bridge, "NOTIFY_ON_ADD", False), \
              mock.patch.object(bridge, "alert") as al:
@@ -624,15 +677,33 @@ class TestProcessOne(unittest.TestCase):
 
     def test_mutexpired_propagates(self):
         match = {"foreignAlbumId": "rg1", "artist": {"foreignArtistId": "aid1"}}
-        with mock.patch.object(bridge, "resolve_album", return_value=match), \
+        with mock.patch.object(bridge, "resolve_album",
+                               return_value=bridge.Resolution(match, 3, None)), \
              mock.patch.object(bridge, "ensure_album_in_lidarr",
                                side_effect=bridge.MUTExpired("x")):
             with self.assertRaises(bridge.MUTExpired):
                 bridge.process_one(self._track())
 
+    def test_low_confidence_records_suggestion(self):
+        # When resolve_album returns no confident album but a candidate is
+        # present, process_one writes the unresolved entry with the suggestion
+        # so the dashboard can render an "Apply suggested match" button.
+        cand = {"foreignAlbumId": "rg-low", "title": "Alb", "artist": "Maybe?"}
+        with mock.patch.object(bridge, "resolve_album",
+                               return_value=bridge.Resolution(None, 1, cand)), \
+             mock.patch.object(bridge, "ensure_album_in_lidarr") as ea, \
+             mock.patch.object(bridge, "record_unresolved") as ru:
+            out = bridge.process_one(self._track())
+        ea.assert_not_called()
+        self.assertEqual(out, {"rg": None, "aid": None})
+        entry = ru.call_args.args[0]
+        self.assertEqual(entry["reason"], "low confidence")
+        self.assertEqual(entry["suggestion"], cand)
+
     def test_generic_error_records_unresolved(self):
         match = {"foreignAlbumId": "rg1", "artist": {"foreignArtistId": "aid1"}}
-        with mock.patch.object(bridge, "resolve_album", return_value=match), \
+        with mock.patch.object(bridge, "resolve_album",
+                               return_value=bridge.Resolution(match, 3, None)), \
              mock.patch.object(bridge, "ensure_album_in_lidarr",
                                side_effect=ValueError("boom")), \
              mock.patch.object(bridge, "record_unresolved") as ru:
@@ -749,6 +820,208 @@ class TestAlert(unittest.TestCase):
     def test_never_raises_on_network_error(self):
         with mock.patch.object(bridge.requests, "post", side_effect=RuntimeError("down")):
             bridge.alert("T", "B")  # must swallow the error
+
+
+class TestActivityLog(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "activity.json")
+        self._p = mock.patch.object(bridge, "ACTIVITY_PATH", self.path)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_newest_first(self):
+        bridge.append_activity({"kind": "add", "artist": "A", "album": "1"})
+        bridge.append_activity({"kind": "add", "artist": "A", "album": "2"})
+        entries = bridge.load_activity()
+        self.assertEqual([e["album"] for e in entries], ["2", "1"])
+        self.assertTrue(entries[0]["at"])  # timestamp filled in
+
+    def test_caps_at_activity_keep(self):
+        with mock.patch.object(bridge, "ACTIVITY_KEEP", 3):
+            for i in range(5):
+                bridge.append_activity({"kind": "add", "artist": "A", "album": str(i)})
+        entries = bridge.load_activity()
+        self.assertEqual(len(entries), 3)
+        self.assertEqual([e["album"] for e in entries], ["4", "3", "2"])
+
+    def test_load_missing_returns_empty(self):
+        self.assertEqual(bridge.load_activity(), [])
+
+
+class TestDeveloperTokenStatus(unittest.TestCase):
+    def _patch_cache(self, exp_seconds_from_now):
+        return mock.patch.object(
+            bridge, "_dev_token_cache",
+            {"token": "tok", "exp": int(time.time()) + exp_seconds_from_now},
+        )
+
+    def test_ok_far_from_expiry(self):
+        with self._patch_cache(60 * 86400), \
+             mock.patch.object(bridge, "developer_token", return_value="tok"):
+            info = bridge.developer_token_status()
+        self.assertEqual(info["level"], "ok")
+        self.assertGreater(info["days_remaining"], 30)
+
+    def test_warning_inside_threshold(self):
+        with self._patch_cache(10 * 86400), \
+             mock.patch.object(bridge, "DEV_TOKEN_WARN_DAYS", 14), \
+             mock.patch.object(bridge, "developer_token", return_value="tok"):
+            info = bridge.developer_token_status()
+        self.assertEqual(info["level"], "warning")
+
+    def test_critical_under_three_days(self):
+        with self._patch_cache(2 * 86400), \
+             mock.patch.object(bridge, "developer_token", return_value="tok"):
+            info = bridge.developer_token_status()
+        self.assertEqual(info["level"], "critical")
+
+
+class TestDigestQueue(unittest.TestCase):
+    def setUp(self):
+        bridge._pending_handoffs.clear()
+
+    def tearDown(self):
+        bridge._pending_handoffs.clear()
+
+    def test_drain_sends_one_alert_for_many_handoffs(self):
+        bridge._queue_handoff("A", "Alb1", "ok")
+        bridge._queue_handoff("B", "Alb2", "ok")
+        with mock.patch.object(bridge, "NOTIFY_ON_ADD", True), \
+             mock.patch.object(bridge, "NOTIFY_DIGEST", True), \
+             mock.patch.object(bridge, "alert") as al:
+            bridge._drain_pending_handoffs()
+        al.assert_called_once()
+        body = al.call_args.args[1]
+        self.assertIn("Alb1", body)
+        self.assertIn("Alb2", body)
+        self.assertEqual(al.call_args.kwargs["notify_type"], "success")
+        self.assertEqual(bridge._pending_handoffs, [])
+
+    def test_drain_noop_when_empty(self):
+        with mock.patch.object(bridge, "NOTIFY_ON_ADD", True), \
+             mock.patch.object(bridge, "NOTIFY_DIGEST", True), \
+             mock.patch.object(bridge, "alert") as al:
+            bridge._drain_pending_handoffs()
+        al.assert_not_called()
+
+    def test_drain_skipped_when_digest_disabled(self):
+        bridge._queue_handoff("A", "Alb", "ok")
+        with mock.patch.object(bridge, "NOTIFY_ON_ADD", True), \
+             mock.patch.object(bridge, "NOTIFY_DIGEST", False), \
+             mock.patch.object(bridge, "alert") as al:
+            bridge._drain_pending_handoffs()
+        al.assert_not_called()
+        # queue is left alone — per-handoff alerts were the legacy path
+        self.assertEqual(len(bridge._pending_handoffs), 1)
+
+
+class TestApplyResolutionShared(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._patches = [
+            mock.patch.object(bridge, "STATE_PATH", os.path.join(self.tmp, "state.json")),
+            mock.patch.object(bridge, "SEEN_PATH", os.path.join(self.tmp, "seen.json")),
+            mock.patch.object(bridge, "UNRESOLVED_PATH", os.path.join(self.tmp, "unresolved.json")),
+            mock.patch.object(bridge, "ACTIVITY_PATH", os.path.join(self.tmp, "activity.json")),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        mock.patch.stopall()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_upgrades_baseline_and_clears_unresolved(self):
+        bridge.save_state({"favorites": {"t1": {"rg": None, "aid": None}}})
+        bridge.save_unresolved([{"id": "t1", "artist": "A", "album": "Alb"}])
+        album = {
+            "foreignAlbumId": "rg1", "title": "Alb",
+            "artist": {"foreignArtistId": "aid1", "artistName": "A",
+                       "titleSlug": "a-aid1"},
+            "images": [{"coverType": "cover", "remoteUrl": "http://img/c.jpg"}],
+        }
+        with mock.patch.object(bridge, "ensure_album_in_lidarr",
+                               return_value="monitored + searched 'Alb' by A"):
+            status = bridge._apply_resolution("t1", album)
+        self.assertIn("monitored + searched", status)
+        self.assertEqual(bridge.load_state()["favorites"]["t1"],
+                         {"rg": "rg1", "aid": "aid1", "slug": "a-aid1"})
+        self.assertEqual(bridge.load_unresolved(), [])
+        activity = bridge.load_activity()
+        self.assertEqual(activity[0]["kind"], "add")
+        self.assertEqual(activity[0]["slug"], "a-aid1")
+        self.assertEqual(activity[0]["cover"], "http://img/c.jpg")
+
+
+class TestAutoRetrySweep(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._patches = [
+            mock.patch.object(bridge, "STATE_PATH", os.path.join(self.tmp, "state.json")),
+            mock.patch.object(bridge, "SEEN_PATH", os.path.join(self.tmp, "seen.json")),
+            mock.patch.object(bridge, "UNRESOLVED_PATH", os.path.join(self.tmp, "unresolved.json")),
+            mock.patch.object(bridge, "ACTIVITY_PATH", os.path.join(self.tmp, "activity.json")),
+        ]
+        for p in self._patches:
+            p.start()
+        bridge._pending_handoffs.clear()
+
+    def tearDown(self):
+        mock.patch.stopall()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        bridge._pending_handoffs.clear()
+
+    def _seed(self):
+        bridge.save_state({"favorites": {"t1": {"rg": None, "aid": None},
+                                          "t2": {"rg": None, "aid": None}}})
+        bridge.save_unresolved([
+            {"id": "t1", "artist": "A", "album": "Alb1", "reason": "no match"},
+            {"id": "t2", "artist": "B", "album": "Alb2", "reason": "no match"},
+        ])
+
+    def test_match_applies_and_clears_entry(self):
+        self._seed()
+        album = {"foreignAlbumId": "rg1",
+                 "artist": {"foreignArtistId": "aid1", "artistName": "A"}}
+        def fake_resolve(artist, album_):
+            if artist == "A":
+                return bridge.Resolution(album, 3, None)
+            return bridge.Resolution(None, 0, None)
+        with mock.patch.object(bridge, "resolve_album", side_effect=fake_resolve), \
+             mock.patch.object(bridge, "ensure_album_in_lidarr", return_value="ok"), \
+             mock.patch.object(bridge, "NOTIFY_ON_ADD", True), \
+             mock.patch.object(bridge, "NOTIFY_DIGEST", True):
+            matched, stayed = bridge._auto_retry_unresolved()
+        self.assertEqual((matched, stayed), (1, 1))
+        remaining = [e["id"] for e in bridge.load_unresolved()]
+        self.assertEqual(remaining, ["t2"])
+        self.assertEqual(bridge.load_state()["favorites"]["t1"]["rg"], "rg1")
+        # The matched handoff was queued for the digest, not alerted directly.
+        self.assertEqual(len(bridge._pending_handoffs), 1)
+
+    def test_no_match_leaves_entry_in_place(self):
+        self._seed()
+        with mock.patch.object(bridge, "resolve_album",
+                               return_value=bridge.Resolution(None, 0, None)), \
+             mock.patch.object(bridge, "ensure_album_in_lidarr") as ea, \
+             mock.patch.object(bridge, "alert"):
+            matched, stayed = bridge._auto_retry_unresolved()
+        ea.assert_not_called()
+        self.assertEqual((matched, stayed), (0, 2))
+        self.assertEqual(len(bridge.load_unresolved()), 2)
+        kinds = [a["kind"] for a in bridge.load_activity()]
+        self.assertEqual(kinds, ["auto-retry-no-match", "auto-retry-no-match"])
+
+    def test_mutexpired_propagates(self):
+        self._seed()
+        with mock.patch.object(bridge, "resolve_album",
+                               side_effect=bridge.MUTExpired("x")):
+            with self.assertRaises(bridge.MUTExpired):
+                bridge._auto_retry_unresolved()
 
 
 if __name__ == "__main__":

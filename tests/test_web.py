@@ -26,6 +26,7 @@ class WebTestBase(unittest.TestCase):
             mock.patch.object(bridge, "STATE_PATH", os.path.join(self.tmp, "state.json")),
             mock.patch.object(bridge, "SEEN_PATH", os.path.join(self.tmp, "seen.json")),
             mock.patch.object(bridge, "UNRESOLVED_PATH", os.path.join(self.tmp, "unresolved.json")),
+            mock.patch.object(bridge, "ACTIVITY_PATH", os.path.join(self.tmp, "activity.json")),
             mock.patch.object(bridge, "MUT_PATH", os.path.join(self.tmp, "mut.txt")),
         ]
         for p in self._patches:
@@ -49,13 +50,18 @@ class TestStatusEndpoint(WebTestBase):
     def test_reports_counts_and_token(self):
         self.seed_state({"a": {"rg": "r", "aid": "x"}, "b": {"rg": None, "aid": None}})
         self.seed_unresolved([{"id": "b", "artist": "A", "album": "Alb", "reason": "no match"}])
-        with mock.patch.object(bridge, "token_status", return_value="valid"):
+        with mock.patch.object(bridge, "token_status", return_value="valid"), \
+             mock.patch.object(bridge, "developer_token_status",
+                               return_value={"exp_at": "2026-11-26T00:00:00+00:00",
+                                             "days_remaining": 180.0, "level": "ok"}):
             r = self.client.get("/api/status")
         self.assertEqual(r.status_code, 200)
         body = r.get_json()
         self.assertEqual(body["token"], "valid")
         self.assertEqual(body["favorites"], 2)
         self.assertEqual(body["unresolved"], 1)
+        self.assertEqual(body["developer_token"]["level"], "ok")
+        self.assertIn("lidarr_url", body)
 
 
 class TestTokenStatus(unittest.TestCase):
@@ -130,7 +136,7 @@ class TestResolve(WebTestBase):
             r = self.client.post("/api/resolve", json={"trackId": "t1", "foreignAlbumId": "rg1"})
         self.assertTrue(r.get_json()["ok"])
         ea.assert_called_once_with(self.ALBUM)
-        self.assertEqual(self.read_state()["t1"], {"rg": "rg1", "aid": "aid1"})
+        self.assertEqual(self.read_state()["t1"], {"rg": "rg1", "aid": "aid1", "slug": None})
         self.assertEqual(bridge.load_unresolved(), [])
 
     def test_404_when_album_not_found(self):
@@ -168,17 +174,19 @@ class TestRetry(WebTestBase):
         self.seed_unresolved([{"id": "t1", "artist": "A", "album": "Alb", "reason": "no match"}])
 
     def test_match_applies(self):
-        with mock.patch.object(bridge, "resolve_album", return_value=self.ALBUM), \
+        with mock.patch.object(bridge, "resolve_album",
+                               return_value=bridge.Resolution(self.ALBUM, 3, None)), \
              mock.patch.object(bridge, "ensure_album_in_lidarr", return_value="ok"):
             r = self.client.post("/api/retry", json={"trackId": "t1"})
         body = r.get_json()
         self.assertTrue(body["ok"])
         self.assertTrue(body["matched"])
-        self.assertEqual(self.read_state()["t1"], {"rg": "rg1", "aid": "aid1"})
+        self.assertEqual(self.read_state()["t1"], {"rg": "rg1", "aid": "aid1", "slug": None})
         self.assertEqual(bridge.load_unresolved(), [])
 
     def test_still_no_match_keeps_entry(self):
-        with mock.patch.object(bridge, "resolve_album", return_value=None), \
+        with mock.patch.object(bridge, "resolve_album",
+                               return_value=bridge.Resolution(None, 0, None)), \
              mock.patch.object(bridge, "ensure_album_in_lidarr") as ea:
             r = self.client.post("/api/retry", json={"trackId": "t1"})
         body = r.get_json()
@@ -197,12 +205,105 @@ class TestPagesRender(WebTestBase):
         r = self.client.get("/")
         self.assertEqual(r.status_code, 200)
         self.assertIn(b"Apple Music Bridge", r.data)
+        self.assertIn(b"Recent activity", r.data)
+        self.assertIn(b"Sync now", r.data)
+        self.assertIn(b"Developer token", r.data)
 
     def test_token_page_injects_dev_token(self):
         with mock.patch.object(bridge, "developer_token", return_value="DEVTOKEN123"):
             r = self.client.get("/token")
         self.assertEqual(r.status_code, 200)
         self.assertIn(b"DEVTOKEN123", r.data)
+
+
+class TestHealthz(WebTestBase):
+    def test_503_when_no_cycle_has_run(self):
+        with mock.patch.object(bridge, "_last_cycle", {"at": None, "added": 0, "removed": 0}):
+            r = self.client.get("/healthz")
+        self.assertEqual(r.status_code, 503)
+        self.assertFalse(r.get_json()["ok"])
+
+    def test_200_when_recent(self):
+        from datetime import datetime, timezone
+        fresh = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with mock.patch.object(bridge, "_last_cycle",
+                               {"at": fresh, "added": 0, "removed": 0}), \
+             mock.patch.object(bridge, "POLL_INTERVAL", 900):
+            r = self.client.get("/healthz")
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertTrue(body["ok"])
+        self.assertLess(body["age_seconds"], 10)
+
+    def test_503_when_stale(self):
+        from datetime import datetime, timezone, timedelta
+        stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec="seconds")
+        with mock.patch.object(bridge, "_last_cycle",
+                               {"at": stale, "added": 0, "removed": 0}), \
+             mock.patch.object(bridge, "POLL_INTERVAL", 900):
+            r = self.client.get("/healthz")
+        self.assertEqual(r.status_code, 503)
+        self.assertGreater(r.get_json()["age_seconds"], 1800)
+
+
+class TestActivityEndpoint(WebTestBase):
+    def test_returns_log_newest_first(self):
+        bridge.append_activity({"kind": "add", "artist": "A", "album": "1"})
+        bridge.append_activity({"kind": "remove", "artist": "B", "album": "2"})
+        r = self.client.get("/api/activity")
+        self.assertEqual(r.status_code, 200)
+        out = r.get_json()
+        self.assertEqual([e["kind"] for e in out], ["remove", "add"])
+
+    def test_empty_when_no_activity(self):
+        r = self.client.get("/api/activity")
+        self.assertEqual(r.get_json(), [])
+
+
+class TestSuggestionApply(WebTestBase):
+    """A low-confidence unresolved entry carries `suggestion: {foreignAlbumId,
+    title, artist}`. The 'Apply suggested match' button just calls /api/resolve
+    with that foreignAlbumId — verify that round-trip clears the entry."""
+
+    ALBUM = {"foreignAlbumId": "rg-low", "title": "Maybe",
+             "artist": {"foreignArtistId": "aid-low", "artistName": "Maybe?"}}
+
+    def test_apply_suggestion_clears_unresolved(self):
+        self.seed_state({"t1": {"rg": None, "aid": None}})
+        self.seed_unresolved([{
+            "id": "t1", "artist": "Foo", "album": "Maybe",
+            "reason": "low confidence",
+            "suggestion": {"foreignAlbumId": "rg-low",
+                           "title": "Maybe", "artist": "Maybe?"},
+        }])
+        with mock.patch.object(bridge, "_lidarr_album_by_mbid", return_value=self.ALBUM), \
+             mock.patch.object(bridge, "ensure_album_in_lidarr", return_value="ok"):
+            r = self.client.post("/api/resolve",
+                                 json={"trackId": "t1", "foreignAlbumId": "rg-low"})
+        self.assertTrue(r.get_json()["ok"])
+        self.assertEqual(bridge.load_unresolved(), [])
+        self.assertEqual(self.read_state()["t1"]["rg"], "rg-low")
+
+
+class TestSyncEndpoint(WebTestBase):
+    def test_runs_sync_and_drains_digest(self):
+        with mock.patch.object(bridge, "sync_favorites",
+                               return_value=(2, 2, 1, 1)) as sf, \
+             mock.patch.object(bridge, "_drain_pending_handoffs") as drain:
+            r = self.client.post("/api/sync", json={})
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["added"], 2)
+        self.assertEqual(body["removed_done"], 1)
+        sf.assert_called_once_with(act=True)
+        drain.assert_called_once()
+
+    def test_401_when_token_expired(self):
+        with mock.patch.object(bridge, "sync_favorites",
+                               side_effect=bridge.MUTExpired("nope")):
+            r = self.client.post("/api/sync", json={})
+        self.assertEqual(r.status_code, 401)
 
 
 if __name__ == "__main__":

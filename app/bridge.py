@@ -27,6 +27,7 @@ import re
 import sys
 import threading
 import time
+from collections import namedtuple
 from datetime import datetime, timezone
 
 import jwt  # PyJWT, with the `cryptography` extra for ES256
@@ -54,6 +55,10 @@ PROCESS_EXISTING = os.environ.get("PROCESS_EXISTING", "false").lower() in ("1", 
 UNMONITOR_ON_REMOVE = os.environ.get("UNMONITOR_ON_REMOVE", "true").lower() in ("1", "true", "yes")
 MAX_REMOVALS_PER_CYCLE = int(os.environ.get("MAX_REMOVALS_PER_CYCLE", "25"))
 NOTIFY_ON_ADD = os.environ.get("NOTIFY_ON_ADD", "true").lower() in ("1", "true", "yes")
+NOTIFY_DIGEST = os.environ.get("NOTIFY_DIGEST", "true").lower() in ("1", "true", "yes")
+UNRESOLVED_RETRY_INTERVAL = int(os.environ.get("UNRESOLVED_RETRY_INTERVAL", "86400"))
+ACTIVITY_KEEP = int(os.environ.get("ACTIVITY_KEEP", "100"))
+DEV_TOKEN_WARN_DAYS = int(os.environ.get("DEV_TOKEN_WARN_DAYS", "14"))
 
 APPRISE_URL = os.environ.get("APPRISE_URL", "http://172.16.238.45:8000").rstrip("/")
 APPRISE_KEY = os.environ.get("APPRISE_KEY", "media").strip()
@@ -70,6 +75,7 @@ MUT_PATH = os.path.join(STATE_DIR, "mut.txt")
 SEEN_PATH = os.path.join(STATE_DIR, "seen.json")  # legacy v1 state, migrated on first load
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 UNRESOLVED_PATH = os.path.join(STATE_DIR, "unresolved.json")
+ACTIVITY_PATH = os.path.join(STATE_DIR, "activity.json")
 
 AM_BASE = "https://api.music.apple.com"
 MB_BASE = "https://musicbrainz.org/ws/2"
@@ -151,6 +157,33 @@ def token_status():
         return "expired"
     except Exception:
         return "valid"  # a transient non-auth error doesn't mean the token is bad
+
+
+def developer_token_status():
+    """Snapshot of the ES256 developer token's expiry.
+
+    Returns {exp_at, days_remaining, level} where `level` is 'ok',
+    'warning' (< DEV_TOKEN_WARN_DAYS), or 'critical' (< 3 days). Calls
+    developer_token() so the cache is populated even on first request.
+    """
+    try:
+        developer_token()  # ensure the cache has a real exp value
+    except Exception as exc:
+        return {"exp_at": None, "days_remaining": None,
+                "level": "unknown", "error": str(exc)}
+    exp = int(_dev_token_cache.get("exp") or 0)
+    if not exp:
+        return {"exp_at": None, "days_remaining": None, "level": "unknown"}
+    remaining = exp - int(time.time())
+    days = remaining / 86400.0
+    if days < 3:
+        level = "critical"
+    elif days < DEV_TOKEN_WARN_DAYS:
+        level = "warning"
+    else:
+        level = "ok"
+    exp_iso = datetime.fromtimestamp(exp, tz=timezone.utc).isoformat(timespec="seconds")
+    return {"exp_at": exp_iso, "days_remaining": round(days, 2), "level": level}
 
 
 # --------------------------------------------------------------------------- #
@@ -310,6 +343,20 @@ def _lidarr_album_by_mbid(rg_mbid):
     return results[0] if results else None
 
 
+def album_display_meta(album_lookup):
+    """Extract (artist_slug, cover_url) from a Lidarr album lookup payload.
+
+    Both may be None — the activity feed and deep-links degrade gracefully when
+    Lidarr's response doesn't include them.
+    """
+    nested = album_lookup.get("artist") or {}
+    slug = (nested.get("titleSlug") or "").strip() or None
+    cover = next((img.get("remoteUrl") or img.get("url")
+                  for img in (album_lookup.get("images") or [])
+                  if img.get("coverType") == "cover"), None)
+    return slug, cover
+
+
 def _lidarr_text_lookup(artist, album):
     term = f"{artist} {album}".strip()
     try:
@@ -329,6 +376,15 @@ def _lidarr_text_lookup(artist, album):
     return best if best_score > 0 else None
 
 
+# Result of resolve_album. `album` is a Lidarr album lookup dict when the match
+# is confident enough to add automatically; otherwise None. `score` is the best
+# 0..3 MusicBrainz score we saw (3=title+artist exact, 2=substring+artist,
+# 1=title-only). `candidate` is non-None when score==1: a {foreignAlbumId,
+# title, artist} suggestion the dashboard can offer as "Apply suggested match",
+# turning a silent miss into a one-click confirmation.
+Resolution = namedtuple("Resolution", ["album", "score", "candidate"])
+
+
 def resolve_album(artist, album):
     """Resolve a favorited song's album to an addable Lidarr album resource.
 
@@ -336,12 +392,17 @@ def resolve_album(artist, album):
     Lidarr for that exact release-group id. Falls back to Lidarr's own loose
     text lookup if MusicBrainz finds nothing — which also covers the rare case
     where MusicBrainz is unreachable.
+
+    Returns a Resolution. The dashboard uses `.candidate` (when set) to render
+    a one-click "Apply suggested match" button on the unresolved entry.
     """
     album_q = _SUFFIX_RE.sub("", album).strip()
+    candidate = None
+    best_score = 0
     try:
         query = f'releasegroup:"{_lucene_clean(album_q)}" AND artist:"{_lucene_clean(artist)}"'
         data = mb_get("release-group", {"query": query, "limit": 10})
-        best, best_score = None, 0
+        best = None
         for rg in data.get("release-groups", []):
             score = _match_score(rg.get("title", ""), _mb_artist_name(rg), album, artist)
             if score > best_score:
@@ -349,10 +410,19 @@ def resolve_album(artist, album):
         if best and best_score >= 2:
             album_resource = _lidarr_album_by_mbid(best["id"])
             if album_resource:
-                return album_resource
+                return Resolution(album_resource, best_score, None)
+        if best and best_score == 1:
+            candidate = {
+                "foreignAlbumId": best.get("id"),
+                "title": best.get("title") or album,
+                "artist": _mb_artist_name(best) or artist,
+            }
     except Exception as exc:
         log.warning("MusicBrainz lookup failed for %s — %s: %s", artist, album, exc)
-    return _lidarr_text_lookup(artist, album)
+    fallback = _lidarr_text_lookup(artist, album)
+    if fallback:
+        return Resolution(fallback, max(best_score, 2), None)
+    return Resolution(None, best_score, candidate)
 
 
 def find_existing_artist(artist_mbid):
@@ -590,6 +660,125 @@ def remove_unresolved(track_id):
 
 
 # --------------------------------------------------------------------------- #
+# Activity feed (ring buffer of recent loop/web actions)
+# --------------------------------------------------------------------------- #
+
+
+def load_activity():
+    """Return the activity log (newest first), capped at ACTIVITY_KEEP."""
+    if not os.path.exists(ACTIVITY_PATH):
+        return []
+    try:
+        with open(ACTIVITY_PATH) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _save_activity(entries):
+    tmp = ACTIVITY_PATH + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(entries, fh)
+    os.replace(tmp, ACTIVITY_PATH)
+
+
+def append_activity(entry):
+    """Prepend an activity entry to the ring buffer, capped at ACTIVITY_KEEP.
+
+    Entry shape: {at, kind, artist, album, status?, slug?, cover?}. `kind` is
+    one of 'add', 'remove', 'auto-retry-match', 'auto-retry-no-match'. Failures
+    are swallowed — the activity log is best-effort and must not crash a cycle.
+    """
+    try:
+        entry = dict(entry)
+        entry.setdefault("at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        with _STATE_LOCK:
+            entries = load_activity()
+            entries.insert(0, entry)
+            del entries[ACTIVITY_KEEP:]
+            _save_activity(entries)
+    except Exception as exc:
+        log.warning("Could not record activity entry: %s", exc)
+
+
+# --------------------------------------------------------------------------- #
+# Notification digest + auto-retry sweep state
+# --------------------------------------------------------------------------- #
+
+# Per-cycle list of handoffs that should be summarized into one Apprise message
+# when the loop finishes a sync. Drained by _drain_pending_handoffs(). When
+# NOTIFY_DIGEST is false, process_one sends per-handoff alerts and leaves this
+# empty.
+_pending_handoffs = []
+
+# Epoch seconds the auto-retry sweep last ran (0 = never). Gated by
+# UNRESOLVED_RETRY_INTERVAL so cmd_loop only walks unresolved entries
+# occasionally, not every cycle.
+_last_retry_at = 0.0
+
+# The dev-token exp value we last sent a "renew soon" Apprise warning for.
+# Reset implicitly whenever developer_token() re-signs (the exp changes), so a
+# new warning fires on the next near-expiry window.
+_dev_warn_sent_for_exp = 0
+
+
+def _queue_handoff(artist, album, status):
+    """Buffer a successful handoff for the cycle-end digest. Holds the lock so
+    concurrent web-driven adds don't race the loop's drain."""
+    with _STATE_LOCK:
+        _pending_handoffs.append({"artist": artist, "album": album, "status": status})
+
+
+def _drain_pending_handoffs():
+    """If any handoffs were buffered this cycle, send a single combined Apprise
+    success message and clear the buffer."""
+    if not (NOTIFY_ON_ADD and NOTIFY_DIGEST):
+        return
+    with _STATE_LOCK:
+        pending = list(_pending_handoffs)
+        _pending_handoffs.clear()
+    if not pending:
+        return
+    n = len(pending)
+    lines = [f'• "{p["album"] or "?"}" by {p["artist"] or "?"} — {p["status"]}'
+             for p in pending]
+    body = f"Handed {n} favorited album{'s' if n != 1 else ''} to Lidarr:\n" + "\n".join(lines)
+    alert("Apple Music → Lidarr", body, notify_type="success")
+
+
+def _apply_resolution(track_id, album_lookup):
+    """Add/monitor an album in Lidarr, upgrade the saved favorite from a
+    {rg:None} baseline to the real ids, drop the unresolved entry, and record
+    an 'add' activity entry. Returns the Lidarr status string.
+
+    The network call runs outside the state lock; only the state writes are
+    guarded. Notification (per-handoff or digest) is the caller's job — this
+    helper is shared by the web UI (silent: user sees the result on screen)
+    and the auto-retry sweep (which DOES notify, via _queue_handoff)."""
+    status = ensure_album_in_lidarr(album_lookup)
+    slug, cover = album_display_meta(album_lookup)
+    with _STATE_LOCK:
+        state = load_state()
+        state["favorites"][track_id] = {
+            "rg": album_lookup.get("foreignAlbumId"),
+            "aid": (album_lookup.get("artist") or {}).get("foreignArtistId"),
+            "slug": slug,
+        }
+        save_state(state)
+        remove_unresolved(track_id)
+    append_activity({
+        "kind": "add",
+        "artist": (album_lookup.get("artist") or {}).get("artistName"),
+        "album": album_lookup.get("title"),
+        "status": status,
+        "slug": slug,
+        "cover": cover,
+    })
+    return status
+
+
+# --------------------------------------------------------------------------- #
 # Core flow
 # --------------------------------------------------------------------------- #
 
@@ -621,22 +810,36 @@ def process_one(track, notify=True):
         return {"rg": None, "aid": None}
 
     try:
-        match = resolve_album(artist, album)
-        if not match:
-            log.warning("No confident match for: %s", label)
-            record_unresolved({"id": tid, "name": name, "artist": artist,
-                               "album": album, "reason": "no match"})
+        res = resolve_album(artist, album)
+        if not res.album:
+            reason = "low confidence" if res.candidate else "no match"
+            log.warning("No confident match for: %s (%s)", label, reason)
+            entry = {"id": tid, "name": name, "artist": artist,
+                     "album": album, "reason": reason}
+            if res.candidate:
+                entry["suggestion"] = res.candidate
+            record_unresolved(entry)
             return {"rg": None, "aid": None}
+        match = res.album
         status = ensure_album_in_lidarr(match)
         log.info("%s -> %s", label, status)
+        slug, cover = album_display_meta(match)
+        append_activity({
+            "kind": "add", "artist": artist, "album": album,
+            "status": status, "slug": slug, "cover": cover,
+        })
         if notify and NOTIFY_ON_ADD:
-            alert(
-                "Apple Music → Lidarr",
-                f'Favorited "{name or album}" — {status}.',
-                notify_type="success",
-            )
+            if NOTIFY_DIGEST:
+                _queue_handoff(artist, album, status)
+            else:
+                alert(
+                    "Apple Music → Lidarr",
+                    f'Favorited "{name or album}" — {status}.',
+                    notify_type="success",
+                )
         return {"rg": match.get("foreignAlbumId"),
-                "aid": (match.get("artist") or {}).get("foreignArtistId")}
+                "aid": (match.get("artist") or {}).get("foreignArtistId"),
+                "slug": slug}
     except MUTExpired:
         raise
     except Exception as exc:
@@ -703,7 +906,13 @@ def _sync_favorites_unlocked(act=True):
                              "maps to that album; leaving it monitored")
                     continue
                 try:
-                    log.info("Un-favorited -> %s", unmonitor_album(rg, info.get("aid")))
+                    status = unmonitor_album(rg, info.get("aid"))
+                    log.info("Un-favorited -> %s", status)
+                    append_activity({
+                        "kind": "remove",
+                        "artist": None, "album": None,
+                        "status": status, "slug": info.get("slug"),
+                    })
                     removed_done += 1
                 except Exception as exc:
                     log.error("Failed to un-monitor %s: %s", rg, exc)
@@ -795,6 +1004,88 @@ def _cmd_backfill_unlocked():
         )
 
 
+def _auto_retry_unresolved():
+    """Re-resolve every unresolved entry against MusicBrainz/Lidarr.
+
+    Many "no match" entries are just *not catalogued yet* — MusicBrainz fills
+    in over days. This sweep replays the resolve for each entry; on a hit the
+    album is added to Lidarr, the favorite's baseline is upgraded with the
+    real ids, the unresolved entry is dropped, and the handoff is queued for
+    the cycle's digest.
+
+    Lookups happen outside the state lock so MB's 1-req/s pacing doesn't block
+    web requests. Bounded by however many entries you have — a 50-entry sweep
+    takes ~50s. Skipped entries (missing artist/album) stay put.
+    """
+    entries = load_unresolved()
+    if not entries:
+        return 0, 0
+    log.info("Auto-retry sweep: %d unresolved entr%s",
+             len(entries), "y" if len(entries) == 1 else "ies")
+    matched = stayed = 0
+    for entry in entries:
+        tid = entry.get("id")
+        artist, album = entry.get("artist"), entry.get("album")
+        if not (tid and artist and album):
+            continue
+        try:
+            res = resolve_album(artist, album)
+        except MUTExpired:
+            raise
+        except Exception as exc:
+            log.warning("Auto-retry lookup failed for %s — %s: %s", artist, album, exc)
+            res = Resolution(None, 0, None)
+        if not res.album:
+            stayed += 1
+            append_activity({"kind": "auto-retry-no-match",
+                             "artist": artist, "album": album})
+            continue
+        try:
+            status = _apply_resolution(tid, res.album)
+        except MUTExpired:
+            raise
+        except Exception as exc:
+            log.error("Auto-retry apply failed for %s — %s: %s", artist, album, exc)
+            continue
+        log.info("Auto-retry matched: %s — %s -> %s", artist, album, status)
+        matched += 1
+        append_activity({"kind": "auto-retry-match",
+                         "artist": artist, "album": album, "status": status})
+        if NOTIFY_ON_ADD and NOTIFY_DIGEST:
+            _queue_handoff(artist, album, status)
+        elif NOTIFY_ON_ADD:
+            alert("Apple Music → Lidarr",
+                  f'Auto-retry matched "{album}" by {artist} — {status}.',
+                  notify_type="success")
+    return matched, stayed
+
+
+def _maybe_warn_dev_token_expiry():
+    """Fire a one-shot Apprise warning when the developer token drops below
+    DEV_TOKEN_WARN_DAYS. Re-arms when developer_token() re-signs (the cached
+    exp changes), so a subsequent warning fires for the next near-expiry."""
+    global _dev_warn_sent_for_exp
+    try:
+        info = developer_token_status()
+    except Exception:
+        return
+    exp_at = info.get("exp_at")
+    days = info.get("days_remaining")
+    if info.get("level") not in ("warning", "critical") or days is None or not exp_at:
+        return
+    current_exp = int(_dev_token_cache.get("exp") or 0)
+    if current_exp == _dev_warn_sent_for_exp:
+        return  # already warned for this signing
+    alert(
+        "Apple Music developer token expiring",
+        f"The MusicKit developer token expires in ~{days:.1f} day(s) "
+        f"({exp_at}). Re-sign by restarting the container with the .p8 in "
+        f"place (developer_token() re-signs automatically on next use).",
+        notify_type="warning",
+    )
+    _dev_warn_sent_for_exp = current_exp
+
+
 def cmd_loop():
     fresh = not os.path.exists(STATE_PATH) and not os.path.exists(SEEN_PATH)
     if fresh:
@@ -806,6 +1097,7 @@ def cmd_loop():
             log.info("First run: baselined existing favorites; acting on changes only.")
 
     alerted = False
+    global _last_retry_at
     while True:
         try:
             a, aok, r, rdone = sync_favorites(act=True)
@@ -815,14 +1107,26 @@ def cmd_loop():
             if a or r:
                 log.info("Cycle: +%d new (%d added), -%d removed (%d un-monitored)", a, aok, r, rdone)
             alerted = False
+
+            # Auto-retry sweep: walk unresolved entries once per
+            # UNRESOLVED_RETRY_INTERVAL and clear any that now match.
+            now = time.time()
+            if UNRESOLVED_RETRY_INTERVAL > 0 and now - _last_retry_at >= UNRESOLVED_RETRY_INTERVAL:
+                try:
+                    _auto_retry_unresolved()
+                finally:
+                    _last_retry_at = now
+
+            _drain_pending_handoffs()
+            _maybe_warn_dev_token_expiry()
         except MUTExpired as exc:
             log.error("Music User Token problem: %s", exc)
             if not alerted:
                 alert(
                     "Apple Music token expired",
                     "The Apple Music favorites bridge can no longer read your "
-                    "favorites. Re-run the sign-in (mint_mut.py) to mint a new "
-                    "Music User Token, then update /data/mut.txt on Shard.",
+                    "favorites. Open the web UI and click 'Renew sign-in token' "
+                    "(no restart needed), or re-run mint_mut.py as a fallback.",
                 )
                 alerted = True
         except Exception as exc:
