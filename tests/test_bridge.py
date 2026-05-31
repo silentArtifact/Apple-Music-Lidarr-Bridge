@@ -208,6 +208,12 @@ class TestSyncFavorites(unittest.TestCase):
         um.assert_called_once_with("rg1", "aid")
         self.assertEqual((removed, removed_done), (1, 1))
         self.assertNotIn("t1", self._state())
+        # The un-monitor is also recorded in the activity feed so the dashboard
+        # shows what the bridge took down, not just what it added.
+        activity = bridge.load_activity()
+        self.assertEqual(len(activity), 1)
+        self.assertEqual(activity[0]["kind"], "remove")
+        self.assertEqual(activity[0]["status"], "un-monitored")
 
     def test_shared_album_not_unmonitored(self):
         self._seed([self._track("t1"), self._track("t2")], rg_for=lambda tid: "rg1")
@@ -597,6 +603,20 @@ class TestEnsureAlbumNewArtist(unittest.TestCase):
 
 
 class TestProcessOne(unittest.TestCase):
+    def setUp(self):
+        # Most cases mock record_unresolved/alert directly, but the success
+        # path always calls append_activity — patch ACTIVITY_PATH at the class
+        # level so the entries go to a temp file instead of /data.
+        self.tmp = tempfile.mkdtemp()
+        self._p = mock.patch.object(
+            bridge, "ACTIVITY_PATH",
+            os.path.join(self.tmp, "activity.json"))
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
     @staticmethod
     def _track(artist="A", album="Alb", name="song", tid="t1"):
         return {"id": tid, "attributes": {"playParams": {"catalogId": tid},
@@ -851,6 +871,22 @@ class TestActivityLog(unittest.TestCase):
     def test_load_missing_returns_empty(self):
         self.assertEqual(bridge.load_activity(), [])
 
+    def test_load_returns_empty_on_corrupt_file(self):
+        # A partial write or a JSON the parser can't read shouldn't crash the
+        # poll loop — it should look like "no activity yet" and let the next
+        # append rewrite the file cleanly.
+        with open(self.path, "w") as fh:
+            fh.write("not json {{")
+        self.assertEqual(bridge.load_activity(), [])
+        bridge.append_activity({"kind": "add", "artist": "A", "album": "X"})
+        self.assertEqual(len(bridge.load_activity()), 1)
+
+    def test_preserves_caller_supplied_timestamp(self):
+        bridge.append_activity({"at": "2026-01-02T03:04:05+00:00",
+                                "kind": "add", "artist": "A", "album": "Y"})
+        self.assertEqual(bridge.load_activity()[0]["at"],
+                         "2026-01-02T03:04:05+00:00")
+
 
 class TestDeveloperTokenStatus(unittest.TestCase):
     def _patch_cache(self, exp_seconds_from_now):
@@ -1022,6 +1058,239 @@ class TestAutoRetrySweep(unittest.TestCase):
                                side_effect=bridge.MUTExpired("x")):
             with self.assertRaises(bridge.MUTExpired):
                 bridge._auto_retry_unresolved()
+
+    def test_skips_entries_missing_artist_or_album(self):
+        # Hand-edited or legacy unresolved entries can be missing fields.
+        # The sweep must skip them silently rather than crash or send empty
+        # lookups to MusicBrainz / Lidarr.
+        bridge.save_state({"favorites": {}})
+        bridge.save_unresolved([
+            {"id": "t1", "artist": "", "album": "Alb"},
+            {"id": "t2", "artist": "A", "album": ""},
+            {"id": "", "artist": "A", "album": "Alb"},
+        ])
+        with mock.patch.object(bridge, "resolve_album") as ra, \
+             mock.patch.object(bridge, "ensure_album_in_lidarr") as ea:
+            matched, stayed = bridge._auto_retry_unresolved()
+        ra.assert_not_called()
+        ea.assert_not_called()
+        self.assertEqual((matched, stayed), (0, 0))
+        # All three entries are left untouched for manual cleanup.
+        self.assertEqual(len(bridge.load_unresolved()), 3)
+
+    def test_per_entry_lookup_error_continues_sweep(self):
+        # One MusicBrainz failure for an entry should not abort the whole pass.
+        bridge.save_state({"favorites": {"t1": {"rg": None, "aid": None},
+                                          "t2": {"rg": None, "aid": None}}})
+        bridge.save_unresolved([
+            {"id": "t1", "artist": "A", "album": "Alb1"},
+            {"id": "t2", "artist": "B", "album": "Alb2"},
+        ])
+        album = {"foreignAlbumId": "rg2",
+                 "artist": {"foreignArtistId": "aid2", "artistName": "B"}}
+        def fake_resolve(artist, _album):
+            if artist == "A":
+                raise RuntimeError("MB went sideways")
+            return bridge.Resolution(album, 3, None)
+        with mock.patch.object(bridge, "resolve_album", side_effect=fake_resolve), \
+             mock.patch.object(bridge, "ensure_album_in_lidarr", return_value="ok"):
+            matched, stayed = bridge._auto_retry_unresolved()
+        self.assertEqual(matched, 1)
+        # t1 stayed (error treated as no-match), t2 cleared.
+        ids = sorted(e["id"] for e in bridge.load_unresolved())
+        self.assertEqual(ids, ["t1"])
+
+
+class TestAlbumDisplayMeta(unittest.TestCase):
+    def test_extracts_slug_and_cover(self):
+        slug, cover = bridge.album_display_meta({
+            "artist": {"titleSlug": "radiohead-mbid"},
+            "images": [
+                {"coverType": "disc", "remoteUrl": "http://disc"},
+                {"coverType": "cover", "remoteUrl": "http://cover.jpg"},
+            ],
+        })
+        self.assertEqual(slug, "radiohead-mbid")
+        self.assertEqual(cover, "http://cover.jpg")
+
+    def test_returns_nones_when_payload_empty(self):
+        self.assertEqual(bridge.album_display_meta({}), (None, None))
+
+    def test_cover_is_none_when_no_cover_image(self):
+        _, cover = bridge.album_display_meta({
+            "images": [{"coverType": "disc", "remoteUrl": "http://disc"}],
+        })
+        self.assertIsNone(cover)
+
+    def test_falls_back_to_url_when_remoteUrl_missing(self):
+        # Lidarr sometimes uses `url` instead of `remoteUrl` for locally-proxied
+        # cover art. Either field is acceptable.
+        _, cover = bridge.album_display_meta({
+            "images": [{"coverType": "cover", "url": "/api/v1/cover/123"}],
+        })
+        self.assertEqual(cover, "/api/v1/cover/123")
+
+    def test_blank_slug_becomes_none(self):
+        slug, _ = bridge.album_display_meta({"artist": {"titleSlug": "   "}})
+        self.assertIsNone(slug)
+
+
+class TestMaybeWarnDevTokenExpiry(unittest.TestCase):
+    """Exercises bridge._maybe_warn_dev_token_expiry — fired by cmd_loop each
+    iteration. Must alert once per signed dev-token entering the warning
+    window, and re-arm when the cached exp changes (i.e., after a re-sign)."""
+
+    def setUp(self):
+        bridge._dev_warn_sent_for_exp = 0
+
+    def tearDown(self):
+        bridge._dev_warn_sent_for_exp = 0
+
+    def _cache(self, days):
+        return mock.patch.object(
+            bridge, "_dev_token_cache",
+            {"token": "tok", "exp": int(time.time()) + int(days * 86400)},
+        )
+
+    def test_warns_once_inside_window(self):
+        with self._cache(10), \
+             mock.patch.object(bridge, "DEV_TOKEN_WARN_DAYS", 14), \
+             mock.patch.object(bridge, "developer_token", return_value="tok"), \
+             mock.patch.object(bridge, "alert") as al:
+            bridge._maybe_warn_dev_token_expiry()
+            bridge._maybe_warn_dev_token_expiry()  # idempotent
+        al.assert_called_once()
+        self.assertEqual(al.call_args.kwargs["notify_type"], "warning")
+
+    def test_silent_when_ok(self):
+        with self._cache(60), \
+             mock.patch.object(bridge, "developer_token", return_value="tok"), \
+             mock.patch.object(bridge, "alert") as al:
+            bridge._maybe_warn_dev_token_expiry()
+        al.assert_not_called()
+
+    def test_re_arms_after_exp_changes(self):
+        # First a 10-day-out warning fires. Then the cache's exp jumps (as it
+        # would on a forced re-sign within the test); a still-in-window value
+        # warns again because the watermark tracks the prior exp.
+        with mock.patch.object(bridge, "DEV_TOKEN_WARN_DAYS", 14), \
+             mock.patch.object(bridge, "developer_token", return_value="tok"), \
+             mock.patch.object(bridge, "alert") as al:
+            with self._cache(10):
+                bridge._maybe_warn_dev_token_expiry()
+            self.assertEqual(al.call_count, 1)
+            with self._cache(5):  # different exp, still warning
+                bridge._maybe_warn_dev_token_expiry()
+            self.assertEqual(al.call_count, 2)
+
+    def test_swallows_developer_token_errors(self):
+        # If developer_token() can't be signed (missing .p8, etc.) the warner
+        # must not raise — the loop keeps polling and will retry later.
+        with mock.patch.object(bridge, "developer_token",
+                               side_effect=RuntimeError("no p8")), \
+             mock.patch.object(bridge, "alert") as al:
+            bridge._maybe_warn_dev_token_expiry()  # must not raise
+        al.assert_not_called()
+
+
+class TestCmdLoopIteration(unittest.TestCase):
+    """Drive cmd_loop through exactly one iteration by making time.sleep raise
+    on its first call. Confirms the orchestration — sync, sweep gating,
+    digest drain, dev-token check — is wired correctly. A real loop runs
+    forever; we want a deterministic single-tick smoke test."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._patches = [
+            mock.patch.object(bridge, "STATE_PATH", os.path.join(self.tmp, "state.json")),
+            mock.patch.object(bridge, "SEEN_PATH", os.path.join(self.tmp, "seen.json")),
+            mock.patch.object(bridge, "UNRESOLVED_PATH", os.path.join(self.tmp, "unresolved.json")),
+            mock.patch.object(bridge, "ACTIVITY_PATH", os.path.join(self.tmp, "activity.json")),
+        ]
+        for p in self._patches:
+            p.start()
+        # Pre-seed so the "fresh first run" branch is skipped.
+        bridge.save_state({"favorites": {}})
+        bridge._pending_handoffs.clear()
+        bridge._last_retry_at = 0.0
+
+    def tearDown(self):
+        mock.patch.stopall()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        bridge._pending_handoffs.clear()
+        bridge._last_retry_at = 0.0
+
+    def test_one_iteration_calls_drain_and_warn_and_skips_sweep(self):
+        with mock.patch.object(bridge, "sync_favorites",
+                               return_value=(1, 1, 0, 0)) as sf, \
+             mock.patch.object(bridge, "_drain_pending_handoffs") as drain, \
+             mock.patch.object(bridge, "_maybe_warn_dev_token_expiry") as warn, \
+             mock.patch.object(bridge, "_auto_retry_unresolved") as sweep, \
+             mock.patch.object(bridge, "UNRESOLVED_RETRY_INTERVAL", 0), \
+             mock.patch.object(bridge.time, "sleep",
+                               side_effect=SystemExit("stop")):
+            with self.assertRaises(SystemExit):
+                bridge.cmd_loop()
+        sf.assert_called_once_with(act=True)
+        drain.assert_called_once()
+        warn.assert_called_once()
+        sweep.assert_not_called()
+        # _last_cycle was updated for /api/status / /healthz to read.
+        self.assertTrue(bridge._last_cycle.get("at"))
+
+    def test_sweep_runs_when_interval_elapsed(self):
+        with mock.patch.object(bridge, "sync_favorites",
+                               return_value=(0, 0, 0, 0)), \
+             mock.patch.object(bridge, "_drain_pending_handoffs"), \
+             mock.patch.object(bridge, "_maybe_warn_dev_token_expiry"), \
+             mock.patch.object(bridge, "_auto_retry_unresolved") as sweep, \
+             mock.patch.object(bridge, "UNRESOLVED_RETRY_INTERVAL", 60), \
+             mock.patch.object(bridge.time, "sleep",
+                               side_effect=SystemExit("stop")):
+            with self.assertRaises(SystemExit):
+                bridge.cmd_loop()
+        sweep.assert_called_once()
+        self.assertGreater(bridge._last_retry_at, 0)
+
+    def test_mutexpired_alerts_once_and_keeps_looping(self):
+        # The loop should not crash on a token-expired sync; it logs, sends
+        # one Apprise alert, and resumes. We let it run two ticks: first
+        # ticks raises MUTExpired (alert), second tick succeeds (alerted
+        # resets, no second alert).
+        with mock.patch.object(bridge, "sync_favorites",
+                               side_effect=[bridge.MUTExpired("x"),
+                                            (0, 0, 0, 0)]) as sf, \
+             mock.patch.object(bridge, "_drain_pending_handoffs"), \
+             mock.patch.object(bridge, "_maybe_warn_dev_token_expiry"), \
+             mock.patch.object(bridge, "_auto_retry_unresolved"), \
+             mock.patch.object(bridge, "UNRESOLVED_RETRY_INTERVAL", 0), \
+             mock.patch.object(bridge, "alert") as al, \
+             mock.patch.object(bridge.time, "sleep",
+                               side_effect=[None, SystemExit("stop")]):
+            with self.assertRaises(SystemExit):
+                bridge.cmd_loop()
+        self.assertEqual(sf.call_count, 2)
+        # Exactly one token-expired alert fired (the second tick succeeded).
+        self.assertEqual(al.call_count, 1)
+        self.assertIn("token expired", al.call_args.args[0].lower())
+
+    def test_generic_exception_is_swallowed(self):
+        # A non-MUTExpired exception in sync should be logged and survived.
+        # The next iteration runs normally.
+        with mock.patch.object(bridge, "sync_favorites",
+                               side_effect=[RuntimeError("boom"),
+                                            (0, 0, 0, 0)]) as sf, \
+             mock.patch.object(bridge, "_drain_pending_handoffs") as drain, \
+             mock.patch.object(bridge, "_maybe_warn_dev_token_expiry"), \
+             mock.patch.object(bridge, "_auto_retry_unresolved"), \
+             mock.patch.object(bridge, "UNRESOLVED_RETRY_INTERVAL", 0), \
+             mock.patch.object(bridge.time, "sleep",
+                               side_effect=[None, SystemExit("stop")]):
+            with self.assertRaises(SystemExit):
+                bridge.cmd_loop()
+        self.assertEqual(sf.call_count, 2)
+        # Drain ran for the successful tick, not the failed one.
+        self.assertEqual(drain.call_count, 1)
 
 
 if __name__ == "__main__":

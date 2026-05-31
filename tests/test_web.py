@@ -122,6 +122,21 @@ class TestLidarrSearch(WebTestBase):
         self.assertEqual(r.status_code, 502)
         self.assertIn("error", r.get_json())
 
+    def test_candidate_without_cover_returns_null(self):
+        # Lidarr returns albums with empty / non-cover images for digital-only
+        # singles. The shaper must surface a null cover, not crash or pick a
+        # non-cover image.
+        candidates = [{"foreignAlbumId": "rg2", "title": "Solo",
+                       "albumType": "Single", "releaseDate": "2024-06-01",
+                       "artist": {"artistName": "X"},
+                       "images": [{"coverType": "disc", "remoteUrl": "http://disc"}]}]
+        with mock.patch.object(bridge, "lidarr", return_value=candidates):
+            r = self.client.get("/api/lidarr-search?term=solo")
+        out = r.get_json()
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0]["cover"])
+        self.assertEqual(out[0]["year"], "2024")
+
 
 class TestResolve(WebTestBase):
     ALBUM = {"foreignAlbumId": "rg1", "title": "Alb",
@@ -245,6 +260,16 @@ class TestHealthz(WebTestBase):
         self.assertEqual(r.status_code, 503)
         self.assertGreater(r.get_json()["age_seconds"], 1800)
 
+    def test_503_when_timestamp_unparseable(self):
+        # If something ever scribbles garbage into _last_cycle.at the probe
+        # must report unhealthy rather than throwing — Docker treats a 500
+        # the same as a 503 here but the body shape matters for humans.
+        with mock.patch.object(bridge, "_last_cycle",
+                               {"at": "not-an-iso", "added": 0, "removed": 0}):
+            r = self.client.get("/healthz")
+        self.assertEqual(r.status_code, 503)
+        self.assertIn("reason", r.get_json())
+
 
 class TestActivityEndpoint(WebTestBase):
     def test_returns_log_newest_first(self):
@@ -304,6 +329,15 @@ class TestSyncEndpoint(WebTestBase):
                                side_effect=bridge.MUTExpired("nope")):
             r = self.client.post("/api/sync", json={})
         self.assertEqual(r.status_code, 401)
+
+    def test_500_on_generic_error(self):
+        # Any other exception out of sync_favorites should surface as 500 with
+        # the error string, not crash the request handler.
+        with mock.patch.object(bridge, "sync_favorites",
+                               side_effect=RuntimeError("upstream gone")):
+            r = self.client.post("/api/sync", json={})
+        self.assertEqual(r.status_code, 500)
+        self.assertIn("upstream gone", r.get_json()["error"])
 
 
 if __name__ == "__main__":
